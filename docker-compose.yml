@@ -1,0 +1,15 @@
+name: rpghome
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0.22
+    restart: unless-stopped
+    ports:
+      # Local only: never expose the broker beyond this machine.
+      - "127.0.0.1:1883:1883"
+    volumes:
+      - ./docker/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+
+volumes:
+  mosquitto-data:

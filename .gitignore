@@ -1,0 +1,31 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Tools
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local scratch
+.tmp/
+.env
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Never commit audio into the code repo (it lives in ~/rpg_home_artifacts)
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.m4a
+*.aif
+*.aiff

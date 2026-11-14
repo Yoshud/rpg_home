@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template filled by scripts/start.sh into $RPGHOME_STATE/launchd/<label>.plist. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@LABEL@</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@ENGINE_SH@</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>@REPO@</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>RPGHOME_ARTIFACTS</key>
+		<string>@ARTIFACTS@</string>
+		<key>RPGHOME_STATE</key>
+		<string>@STATE@</string>
+		<key>RPGHOME_MQTT_HOST</key>
+		<string>@MQTT_HOST@</string>
+		<key>RPGHOME_MQTT_PORT</key>
+		<string>@MQTT_PORT@</string>
+	</dict>
+	<!-- Restart after a crash, not after a clean exit; also starts it on load. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<!-- Seconds between SIGTERM and SIGKILL on bootout. -->
+	<key>ExitTimeOut</key>
+	<integer>10</integer>
+	<!-- Real-time audio: never throttle like a background job. -->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>@LOG@</string>
+	<key>StandardErrorPath</key>
+	<string>@LOG@</string>
+</dict>
+</plist>
