@@ -1,0 +1,15 @@
+{
+  "name": "cave",
+  "bed": {
+    "clips": [
+      {"path": "moss_grid/cave_ambience__cfg3__s2.wav", "gain_db": -8.0},
+      {"path": "moss_grid/cave_ambience__default__s3.wav", "gain_db": 0.2},
+      {"path": "moss_grid/cave_ambience__default__s2.wav", "gain_db": -10.0}
+    ],
+    "hold_s": [150, 210],
+    "crossfade_s": 35,
+    "loop_crossfade_s": 4,
+    "gain_db": 0
+  },
+  "gain_db": 0
+}

@@ -36,9 +36,10 @@
 	<!-- Real-time audio: never throttle like a background job. -->
 	<key>ProcessType</key>
 	<string>Interactive</string>
+	<!-- The engine writes its own rotated engine.log; this file gets tracebacks and stray output. -->
 	<key>StandardOutPath</key>
-	<string>@LOG@</string>
+	<string>@STDOUT_LOG@</string>
 	<key>StandardErrorPath</key>
-	<string>@LOG@</string>
+	<string>@STDOUT_LOG@</string>
 </dict>
 </plist>

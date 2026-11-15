@@ -35,5 +35,12 @@ else
   ok=0
 fi
 echo "engine log: $ENGINE_LOG"
+echo "engine stdout/stderr: $ENGINE_STDOUT_LOG"
+# Written by the engine when it had no audio output (removed once it plays again).
+failure="$STATE/engine-audio-failure.json"
+if [[ -f $failure ]]; then
+  echo "engine: last audio failure at $(plutil -extract time raw -o - "$failure" 2>/dev/null || echo '?'):" \
+    "$(plutil -extract reason raw -o - "$failure" 2>/dev/null || echo '?')"
+fi
 
 [[ $ok == 1 ]]

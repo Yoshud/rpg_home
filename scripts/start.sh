@@ -15,7 +15,7 @@ BROKER_WAIT_SECONDS="${RPGHOME_BROKER_WAIT_SECONDS:-15}"
 render_plist() {
   local text key val
   text="$(cat "$REPO_ROOT/scripts/launchd/engine.plist.in")"
-  for key in LABEL ENGINE_SH REPO ARTIFACTS STATE MQTT_HOST MQTT_PORT LOG; do
+  for key in LABEL ENGINE_SH REPO ARTIFACTS STATE MQTT_HOST MQTT_PORT STDOUT_LOG; do
     case "$key" in
       LABEL) val=$ENGINE_LABEL ;;
       ENGINE_SH) val="$REPO_ROOT/scripts/engine.sh" ;;
@@ -24,7 +24,7 @@ render_plist() {
       STATE) val=$STATE ;;
       MQTT_HOST) val=$RPGHOME_MQTT_HOST ;;
       MQTT_PORT) val=$RPGHOME_MQTT_PORT ;;
-      LOG) val=$ENGINE_LOG ;;
+      STDOUT_LOG) val=$ENGINE_STDOUT_LOG ;;
     esac
     text="$(replace_all "$text" "@$key@" "$(xml_escape "$val")")"
   done
@@ -91,10 +91,13 @@ check_engine() {
   fi
   if [[ -z $pid ]]; then
     log "engine: NOT running (state: $(job_field state), $(job_last_exit))"
-    if [[ -f $ENGINE_LOG ]]; then
-      log "last lines of $ENGINE_LOG:"
-      tail -n 20 "$ENGINE_LOG" >&2
-    fi
+    local f
+    for f in "$ENGINE_LOG" "$ENGINE_STDOUT_LOG"; do
+      if [[ -s $f ]]; then
+        log "last lines of $f:"
+        tail -n 20 "$f" >&2
+      fi
+    done
     die "engine failed to start"
   fi
   log "engine: running (pid $pid)"
@@ -103,5 +106,5 @@ check_engine() {
 start_broker
 start_engine
 check_engine
-log "engine log: $ENGINE_LOG"
+log "engine log: $ENGINE_LOG (stdout/stderr: $ENGINE_STDOUT_LOG)"
 log "status: scripts/status.sh   stop: scripts/stop.sh"

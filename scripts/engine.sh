@@ -21,4 +21,4 @@ PYTHON="$REPO_ROOT/.venv/bin/python"
 caffeinate -i -w $$ &
 
 cd "$REPO_ROOT"
-exec "$PYTHON" -m rpghome.engine
+exec "$PYTHON" -m rpghome_engine

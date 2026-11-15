@@ -5,6 +5,7 @@ import plistlib
 import shutil
 import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -190,11 +191,14 @@ def test_start_fails_when_engine_dies(fakes):
     fakes.set("crash")
     log = fakes.state / "logs" / "engine.log"
     log.parent.mkdir(parents=True)
-    log.write_text("Traceback ...\nRuntimeError: no audio device\n")
+    log.write_text("ERROR rpghome.engine: engine crashed\n")
+    (log.parent / "engine.stdout.log").write_text("Traceback ...\nRuntimeError: no audio device\n")
     result = fakes.run("start.sh")
     assert result.returncode != 0
     assert "engine failed to start" in result.stderr
+    assert "engine crashed" in result.stderr
     assert "no audio device" in result.stderr
+    assert f"last lines of {log.parent / 'engine.stdout.log'}:" in result.stdout
     assert "state: not running, last exit code 1)" in result.stdout
 
 
@@ -284,6 +288,7 @@ def test_status_exit_codes(fakes):
     assert "broker: container running, 127.0.0.1:1883 reachable" in out
     assert "state running, pid 4242, never exited, runs 1" in out
     assert f"engine log: {fakes.state / 'logs' / 'engine.log'}" in out
+    assert f"engine stdout/stderr: {fakes.state / 'logs' / 'engine.stdout.log'}" in out
 
     fakes.set("job_state", "not running")
     assert fakes.run("status.sh").returncode == 1
@@ -295,6 +300,19 @@ def test_status_exit_codes(fakes):
     result = fakes.run("status.sh")
     assert result.returncode == 1
     assert "Docker daemon not running" in result.stdout
+
+
+def test_status_shows_the_last_audio_failure(fakes):
+    ok(fakes.run("start.sh"))
+    assert "last audio failure" not in fakes.run("status.sh").stdout
+    failure = fakes.state / "engine-audio-failure.json"
+    failure.write_text(
+        '{"time": "2026-11-15T10:00:00+00:00", "pid": 7, '
+        '"reason": "no audio callback since the start: \\"lid\\" closed?"}\n'
+    )
+    out = fakes.run("status.sh").stdout
+    assert "engine: last audio failure at 2026-11-15T10:00:00+00:00: no audio callback" in out
+    assert '"lid" closed?' in out
 
 
 def test_plist_is_valid_with_special_characters(fakes, tmp_path):
@@ -317,7 +335,7 @@ def test_plist_is_valid_with_special_characters(fakes, tmp_path):
     assert data["ThrottleInterval"] == 5
     assert data["ExitTimeOut"] == 10
     assert data["ProcessType"] == "Interactive"
-    log = str(root / "state dir & <more>" / "logs" / "engine.log")
+    log = str(root / "state dir & <more>" / "logs" / "engine.stdout.log")
     assert data["StandardOutPath"] == data["StandardErrorPath"] == log
 
 
@@ -350,20 +368,24 @@ def test_engine_sh_without_venv(fakes, tmp_path):
 
 def test_engine_sh_execs_engine(fakes):
     """engine.sh keeps its PID (exec), so launchd's SIGTERM reaches the engine."""
+    log = fakes.state / "logs" / "engine.log"
     proc = subprocess.Popen(
         ["/bin/bash", str(SCRIPTS / "engine.sh")],
-        env=fakes.env,
+        env={**fakes.env, "RPGHOME_AUDIO_DEVICE": "null"},
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
     try:
-        first = proc.stdout.readline()
-        assert f"engine stub started pid={proc.pid}" in first
+        deadline = time.monotonic() + 15
+        while f"engine started pid={proc.pid}" not in (log.read_text() if log.exists() else ""):
+            assert proc.poll() is None, proc.stdout.read()
+            assert time.monotonic() < deadline, "engine did not log its start"
+            time.sleep(0.05)
         proc.send_signal(signal.SIGTERM)
-        out, _ = proc.communicate(timeout=10)
+        proc.communicate(timeout=10)
     finally:
         proc.kill()
     assert proc.returncode == 0
-    assert "received SIGTERM, stopping" in out
+    assert "received SIGTERM, stopping" in log.read_text()
     assert fakes.calls("caffeinate") == [f"caffeinate -i -w {proc.pid}"]

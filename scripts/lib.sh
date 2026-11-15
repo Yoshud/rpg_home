@@ -7,7 +7,7 @@
 #   RPGHOME_ARTIFACTS  data folder   (default ~/rpg_home_artifacts)
 #   RPGHOME_STATE      state folder  (default ~/.local/state/rpghome), not inside the data folder
 #   RPGHOME_MQTT_HOST  (default 127.0.0.1), RPGHOME_MQTT_PORT (default 1883)
-# and sets REPO_ROOT, ARTIFACTS, STATE, LOG_DIR, ENGINE_LOG, ENGINE_LABEL.
+# and sets REPO_ROOT, ARTIFACTS, STATE, LOG_DIR, ENGINE_LOG, ENGINE_STDOUT_LOG, ENGINE_LABEL.
 
 LOG_TAG="${LOG_TAG:-$(basename "$0" .sh)}"
 
@@ -146,6 +146,7 @@ RPGHOME_STATE=$STATE
 export RPGHOME_ARTIFACTS RPGHOME_STATE RPGHOME_MQTT_HOST RPGHOME_MQTT_PORT
 
 LOG_DIR="$STATE/logs"
-ENGINE_LOG="$LOG_DIR/engine.log"
+ENGINE_LOG="$LOG_DIR/engine.log"               # the engine's own log (rotated)
+ENGINE_STDOUT_LOG="$LOG_DIR/engine.stdout.log" # stdout/stderr of the job: tracebacks, stray output
 ENGINE_LABEL="${RPGHOME_ENGINE_LABEL:-local.rpghome.engine}"
 [[ $ENGINE_LABEL =~ ^[A-Za-z0-9._-]+$ ]] || die "RPGHOME_ENGINE_LABEL may contain only letters, digits, '.', '_' and '-'"

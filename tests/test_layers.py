@@ -1,9 +1,11 @@
-"""Imports between rpghome subpackages go only downwards (see README, "Layout")."""
+"""Imports between rpghome subpackages go only downwards, and the engine package uses only
+the bottom of rpghome (see README, "Layout")."""
 
 import ast
 from pathlib import Path
 
 SRC = Path(__file__).parents[1] / "src" / "rpghome"
+ENGINE_SRC = Path(__file__).parents[1] / "src" / "rpghome_engine"
 
 _LOW = {"core", "models", "repositories", "bus", "infra", "managers"}
 ALLOWED: dict[str, set[str]] = {
@@ -18,9 +20,9 @@ ALLOWED: dict[str, set[str]] = {
     "cli": _LOW,
     "mcp": _LOW,
     "runner": _LOW,
-    # The engine gets scene data and commands over the bus only.
-    "engine": {"core", "models", "bus"},
 }
+# rpghome_engine gets scene data and commands over the bus only; rpghome never imports it.
+ENGINE_ALLOWED = {"core", "models", "bus"}
 
 
 def _module_name(path: Path, root: Path) -> list[str]:
@@ -46,22 +48,30 @@ def _imported(tree: ast.AST, module: list[str], is_package: bool) -> list[str]:
     return names
 
 
+def _modules(root: Path):
+    """(dotted module parts, absolute imported names) for every module under `root`."""
+    for path in sorted(root.rglob("*.py")):
+        module = _module_name(path, root)
+        tree = ast.parse(path.read_text(), filename=str(path))
+        yield module, _imported(tree, module, path.name == "__init__.py")
+
+
 def check_layers(root: Path) -> list[str]:
     """Return one message per import that breaks the layer rules under package `root`."""
     top = root.name
     errors = []
-    for path in sorted(root.rglob("*.py")):
-        module = _module_name(path, root)
-        is_package = path.name == "__init__.py"
+    for module, imported in _modules(root):
         layer = module[1] if len(module) > 1 else None
         dotted = ".".join(module)
         if layer is not None and layer not in ALLOWED:
             errors.append(f"{dotted}: unknown layer {layer!r} (add it to the rules)")
             continue
         allowed = ALLOWED.get(layer, set()) if layer else set()
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for name in _imported(tree, module, is_package):
+        for name in imported:
             parts = name.split(".")
+            if parts[0] == ENGINE_SRC.name:
+                errors.append(f"{dotted}: imports {name}; {top} must not import the engine")
+                continue
             if parts[0] != top or len(parts) < 2:
                 continue
             target = parts[1]
@@ -77,9 +87,37 @@ def check_layers(root: Path) -> list[str]:
     return errors
 
 
+def check_engine(root: Path, app: str = SRC.name) -> list[str]:
+    """Return one message per import under the engine package `root` that reaches into the
+    app package `app` beyond the layers the engine may use."""
+    errors = []
+    for module, imported in _modules(root):
+        for name in imported:
+            parts = name.split(".")
+            if parts[0] != app:
+                continue  # itself, the standard library or a third-party library
+            if len(parts) < 2 or parts[1] not in ENGINE_ALLOWED:
+                rule = (
+                    f"{root.name} may import from {app} only: {', '.join(sorted(ENGINE_ALLOWED))}"
+                )
+                errors.append(f"{'.'.join(module)}: imports {name}; {rule}")
+    return errors
+
+
+def _write_tree(root: Path, files: dict[str, str]) -> None:
+    for name, text in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text)
+
+
 def test_package_respects_layers():
     errors = check_layers(SRC)
     assert not errors, "layer violations:\n" + "\n".join(errors)
+
+
+def test_engine_uses_only_core_models_bus():
+    errors = check_engine(ENGINE_SRC)
+    assert not errors, "engine import violations:\n" + "\n".join(errors)
 
 
 def test_checker_catches_violations(tmp_path):
@@ -93,7 +131,6 @@ def test_checker_catches_violations(tmp_path):
         "infra/other.py": "",
         "managers/__init__.py": "",
         "managers/scenes.py": "import rpghome.infra.ffmpeg\nfrom ..cli import main\n",
-        "engine/__init__.py": "def f():\n    from rpghome import repositories\n",
         "cli/__init__.py": "",
         "cli/main.py": "from rpghome.api.app import app\n",
         "api/__init__.py": "",
@@ -101,17 +138,59 @@ def test_checker_catches_violations(tmp_path):
         "repositories/__init__.py": "",
         "weird/__init__.py": "",
     }
-    for name, text in files.items():
-        (pkg / name).parent.mkdir(parents=True, exist_ok=True)
-        (pkg / name).write_text(text)
+    _write_tree(pkg, files)
 
     errors = check_layers(pkg)
-    assert len(errors) == 5, errors
+    assert len(errors) == 4, errors
     joined = "\n".join(errors)
     assert "rpghome.core.config: imports rpghome.managers.scenes" in joined
     assert "core may import only: nothing" in joined
     assert "rpghome.managers.scenes: imports rpghome.cli.main (rpghome.cli)" in joined
-    assert "rpghome.engine: imports rpghome.repositories" in joined
-    assert "engine may import only: bus, core, models" in joined
     assert "rpghome.cli.main: imports rpghome.api.app" in joined
     assert "rpghome.weird: unknown layer 'weird'" in joined
+
+
+def test_checker_catches_app_importing_engine(tmp_path):
+    pkg = tmp_path / "rpghome"
+    _write_tree(
+        pkg,
+        {
+            "__init__.py": "",
+            "core/__init__.py": "",
+            "api/__init__.py": "",
+            "api/app.py": "import rpghome_engine.core\n",
+            "cli/__init__.py": "",
+            "cli/main.py": "def f():\n    from rpghome_engine import __main__\n",
+        },
+    )
+
+    errors = check_layers(pkg)
+    assert len(errors) == 2, errors
+    joined = "\n".join(errors)
+    assert "rpghome.api.app: imports rpghome_engine.core; rpghome must not import" in joined
+    assert "rpghome.cli.main: imports rpghome_engine.__main__" in joined
+
+
+def test_checker_catches_engine_importing_app(tmp_path):
+    pkg = tmp_path / "rpghome_engine"
+    _write_tree(
+        pkg,
+        {
+            "__init__.py": "",
+            "core.py": (
+                "import numpy\nfrom rpghome.core.config import Settings\n"
+                "from rpghome.models import scene\nfrom . import mixer\n"
+                "from rpghome_engine.mixer import Mixer\n"
+            ),
+            "mixer.py": "import rpghome.bus\nfrom rpghome.repositories import catalog\n",
+            "__main__.py": "def f():\n    from rpghome import managers\n    import rpghome\n",
+        },
+    )
+
+    errors = check_engine(pkg)
+    assert len(errors) == 3, errors
+    joined = "\n".join(errors)
+    assert "rpghome_engine.mixer: imports rpghome.repositories.catalog" in joined
+    assert "may import from rpghome only: bus, core, models" in joined
+    assert "rpghome_engine.__main__: imports rpghome.managers" in joined
+    assert "rpghome_engine.__main__: imports rpghome;" in joined
