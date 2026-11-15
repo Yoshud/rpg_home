@@ -1,0 +1,18 @@
+# Default roles (modes of work) and the maximum role of each device class.
+# Role names live only here: nothing in the code knows them, so a new role needs
+# no code change. `includes` is optional and defaults to none.
+
+[roles.sesja]
+permissions = ["state.read", "library.read", "scene.play", "overlay.play", "fx.play"]
+
+[roles.szybka-edycja]
+includes = ["sesja"]
+permissions = ["scene.write", "overlay.write", "fx.write", "music.fetch", "chat.use"]
+
+[roles.studio]
+includes = ["szybka-edycja"]
+permissions = ["library.review", "library.tag", "library.fetch", "library.generate", "library.use_unreviewed"]
+
+[devices]
+phone = "szybka-edycja"
+mac = "studio"

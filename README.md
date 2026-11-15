@@ -72,6 +72,35 @@ launchd job (LaunchAgent in the `gui/<uid>` domain, label `local.rpghome.engine`
 `uv run rpghome config` prints the resolved settings (data, state and log folders,
 MQTT host and port) and exits 1 if they are invalid. Later tasks add more commands.
 
+## Roles and permissions
+
+Each mode of work is a **role**: a name and its own permissions. A role may include other
+roles (`includes`); its effective permissions are its own plus everything the included
+roles give, transitively. A device class (`phone`, `mac`, …) has a maximum role, and the UI
+switches the current mode only up to it.
+
+Role names live only in `src/rpghome/managers/roles.toml`, which ships with the package:
+`load_roles()` reads it (pass a path for another file), and nothing in
+`managers/permissions.py` knows a role name, so a new role or device class needs no code
+change. The default config:
+
+| role            | its own permissions                                                                                           | includes        |
+|-----------------|---------------------------------------------------------------------------------------------------------------|-----------------|
+| `sesja`         | `state.read`, `library.read`, `scene.play`, `overlay.play`, `fx.play`                                        | —               |
+| `szybka-edycja` | `scene.write`, `overlay.write`, `fx.write`, `music.fetch`, `chat.use`                                        | `sesja`         |
+| `studio`        | `library.review`, `library.tag`, `library.fetch`, `library.generate`, `library.use_unreviewed`              | `szybka-edycja` |
+
+with `[devices] phone = "szybka-edycja"`, `mac = "studio"`.
+
+`managers/permissions.py` holds the 15 known permissions (`PERMISSIONS`) and
+`REQUIRED_PERMISSION`, the one table saying what each action needs (`cmd.*`, `mode.switch`,
+`tool.*`, `library.*`, `chat.send`); the app server and the MCP server will ask it later.
+The functions are `effective_permissions`, `includes`, `allowed`, `allowed_action`,
+`can_switch` and `check_switch`. A broken config raises `RolesConfigError` (an unknown
+permission with the closest suggestion, an unknown included role, a cycle in `includes`
+shown as `a -> b -> a`, a device pointing to a missing role, invalid TOML); switching above
+the device's maximum role raises `PermissionDenied`.
+
 ## Environment variables
 
 | variable            | default                  | meaning |
@@ -109,6 +138,7 @@ core/          config.py (paths and settings from the environment), errors.py (R
 models/        domain data: scene, overlay, fx, pool, clip, engine commands and state, roles
 repositories/  persistence: catalog (SQLite + catalog.jsonl), scene files, git of the data folder
 managers/      application logic: scene loading and checks, catalog import, permissions
+               (roles.toml: the default roles config shipped with the package)
 bus/           MQTT: Bus interface, MqttBus, InMemoryBus, topics
 infra/         wrappers around external tools and services (Epidemic API client, MOSS generation, ffmpeg)
 api/           FastAPI: app.py, routers/, ws.py, deps.py, schemas.py (REST DTOs)
