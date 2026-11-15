@@ -2,9 +2,11 @@
 
 import typer
 
+from rpghome.cli import library
 from rpghome.core import config
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help="RPG HOME.")
+app.add_typer(library.app, name="library")
 
 
 @app.callback()

@@ -76,7 +76,238 @@ launchd job (LaunchAgent in the `gui/<uid>` domain, label `local.rpghome.engine`
 ## The `rpghome` command
 
 `uv run rpghome config` prints the resolved settings (data, state and log folders,
-MQTT host and port) and exits 1 if they are invalid. Later tasks add more commands.
+MQTT host and port) and exits 1 if they are invalid. `uv run rpghome library ...` manages
+the clip catalog (see [Library](#library)).
+
+## Library
+
+The clip catalog: every audio clip in the data folder, with its kind, tags, pools, source,
+license, loudness and the user's rating.
+
+### Data layout
+
+```
+catalog.sqlite                       the catalog (SQLite, WAL); not in git
+catalog.jsonl                        its export, tracked in the data folder's git
+generated/moss/sound-gen/round1/     MOSS clips of the first blind test (<line>__<short|detailed>.wav)
+generated/moss/sound-gen/round2/     MOSS clips of the seed/settings grid (<line>__<condition>__s<seed>.wav)
+generated/moss/sound-gen/spots/      MOSS cave spots (<drop|drips|pebbles|rockfall>__s<seed>.wav)
+epidemic/sound-gen/refs/             Epidemic references of both blind tests (<line>.wav)
+epidemic/sound-gen/spots/            Epidemic cave spots (<drop|pebbles|rockfall>_<a|b>.wav)
+```
+
+Everything under `epidemic/` is Epidemic Sound material: license `never-share`, never share or
+publish it. Generated clips are `shareable`. Paths in the catalog are relative to the data
+folder. Code: `models/clip.py`, `models/tags.py`, `repositories/catalog.py`,
+`repositories/tables.py`, `repositories/db.py`, `migrations/`, `infra/ffmpeg.py`,
+`managers/loudness.py`, `managers/library.py`, `cli/library.py`.
+
+- **Clip ids** come from the source, so a re-import finds the same clip:
+  `moss:sound-gen/<round1|round2|spots>/<file name>` and `epidemic:<Epidemic id>`.
+- **Kinds:** `bed` (looped by the engine with crossfades, `loopable`), `spot` (random
+  sound over a bed), `fx` (one-shot), `music`. `status` is `review`, `accepted` or `rejected`.
+  `perspective` (close/medium/far) and `dry` may be unknown (`null`).
+- **Tags** are `category:value` or plain free tags, lowercase words joined by `-`. The
+  categories (`place`, `source`, `weather`, `mood`, `use`, `batch`) are listed once, in
+  `models/tags.py`.
+- **Pools** group clips by use (`cave.bed`, `cave.drops`, ...). A clip may be in several pools,
+  and a pool may be empty.
+
+### Export
+
+`catalog.jsonl` is rewritten after every change, and only when its bytes change: after the
+commit that made the change succeeds (a failed commit leaves no export ahead of the database),
+with the file I/O in a worker thread. Two exports with no change in between are identical:
+- one JSON object per line: pools first (`"record": "pool"`, by name), then clips
+  (`"record": "clip"`, by id);
+- each clip is `Clip.model_dump(mode="json")` without `last_used`, keys sorted. The models keep
+  floats to 3 digits (loudness and gain are in 0.1 dB steps) and tags and pools sorted;
+- there are no timestamps. `last_used` stays in SQLite only, so playing a clip makes no diff.
+
+### Database and migrations
+
+The models (`models/clip.py`) are pydantic and know nothing of the database. The database side
+is SQLAlchemy 2.0 with its asyncio extension and aiosqlite:
+
+- `repositories/tables.py`: the ORM tables (`DeclarativeBase`). The repository
+  (`repositories/catalog.py`, an async API) maps rows to the pydantic models and back, by
+  column name.
+
+  | table | columns |
+  |-------|---------|
+  | `clips` | `id` (key), `path` (unique), `kind`, `status`, `source`, `license` (indexed), `rating`, `title`, `last_used` (UTC), `perspective`, `dry`, `loopable`, `gain_db`, `duration_s`, `channels`, `sample_rate`, `notes`, `sha256`; JSON: `details` (MOSS or Epidemic fields), `loudness`, `imported`; `search_text` (what a text search reads) |
+  | `clip_tags` | `clip_id`, `tag` (indexed) |
+  | `pools` | `name` (key), `description` |
+  | `clip_pools` | `clip_id`, `pool` (indexed) |
+
+  Deleting a clip deletes its tag and pool rows (foreign keys, `ON DELETE CASCADE`).
+- `repositories/db.py`: the engine and session factory for `<data>/catalog.sqlite`
+  (`load_settings()`). Every connection gets WAL mode and foreign keys; write batches start
+  with `BEGIN IMMEDIATE`, so other writers wait (up to 30 s) instead of failing half-way. Only
+  the task that opened a batch may use it: a task started inside one gets a clear error instead
+  of sharing its `AsyncSession`.
+- `migrations/` and `alembic.ini` (repo root): the Alembic migrations, async template,
+  `render_as_batch=True` (SQLite cannot do most `ALTER TABLE`s), `target_metadata` from
+  `tables.py`. The database URL comes from `load_settings()`, never from `alembic.ini`.
+  Revision `0001` creates the schema. `tests/repositories/test_migrations.py` runs
+  `alembic check`, so the tests fail when the migrations and the tables differ.
+
+**The app upgrades on open:** opening a `Catalog` first reads the current revision with a plain
+read (a WAL reader never waits for a writer), and runs `upgrade head` on its own event loop only
+when the database is behind head (Alembic's connection-sharing recipe: `db.run_upgrade` puts the
+connection into `config.attributes["connection"]`, and `env.py` uses it). So `search` and
+`pools` are never blocked by another process's write batch. The upgrade takes the write lock
+and runs with foreign keys off, because a batch migration drops and recreates tables and a
+`DROP TABLE` would cascade into the rows that refer to it; `PRAGMA foreign_key_check` checks
+the result. A database at a revision this code does not know (made by a newer rpghome) is
+refused; so is a file that is not a SQLite database, or a catalog made by the old sqlite3 code
+(its tables, no `alembic_version`) — the error names the file and says to delete it and re-import.
+
+To change the schema, edit `repositories/tables.py`, then:
+
+```sh
+uv run alembic revision --autogenerate -m "what changes"
+```
+
+Read the new file in `migrations/versions/` before you commit it: autogenerate does not see
+renames (it writes a drop and an add) or data changes, and it does not fill a new non-null
+column of existing rows. The next `rpghome` command that opens the catalog upgrades it; by
+hand: `uv run alembic upgrade head` (both on `RPGHOME_ARTIFACTS`). `uv run alembic check`
+says whether the tables and the migrations still match.
+
+### Commands
+
+```sh
+uv run rpghome library import-sound-gen [PATH]     # default ~/claude_code/tasks/sound-gen
+uv run rpghome library search [TEXT] [--tag T]... [--kind K] [--status S] [--source SRC]
+uv run rpghome library pools                       # pool, clips, kinds, accepted clips
+```
+
+`search` prints one line per clip: id, kind, status, rating, gain, title.
+- Tags combine with AND. `--tag place:cave` matches exactly; a plain `--tag cave` also
+  matches any category tag with that value.
+- `TEXT` is a case-insensitive substring of the title (or Epidemic title), the MOSS prompt,
+  the notes or the tags.
+
+### Loudness and gain
+
+At import every clip is measured with ffmpeg's `ebur128` filter (`infra/ffmpeg.py`, following
+sound-gen's `blind.py` and `loop_demo.py`):
+
+| value | what it is | used for |
+|-------|------------|----------|
+| `bed_lufs` | 20th percentile of all momentary values (400 ms windows) after the first 4 (warm-up, window not yet full), as in `loop_demo.py`; no gating | bed |
+| `max_short_term_lufs` | loudest short-term (3 s) window; clips under 3 s are padded with silence, so they read lower | spot, fx |
+| `true_peak_dbtp` | true peak, from the ebur128 summary | ceiling |
+| `integrated_lufs` | integrated loudness | information (music) |
+
+A clip under 3.5 s is padded with silence for the short-term window only; the padded frames
+are not bed values. A level of -120 LUFS or less (ffmpeg's value for no energy) is stored as
+`null`.
+
+`gain_db` is the gain that brings the clip to its kind's target. It is capped so the true
+peak stays at or below -1 dBTP. The engine applies the gain at playback; **the file itself is
+never modified.**
+
+| kind | target | where it comes from |
+|------|--------|---------------------|
+| bed | -31 LUFS bed level | `loop_demo.py` version C, the user's favourite: beds matched at their median bed level, then lowered 8 dB for drip headroom |
+| spot | -42 LUFS max short-term | `spots_demo.py` over that bed: spots at about 10 LU under the bed |
+| fx | -22 LUFS max short-term | `blind.py` round 1: one-shots auditioned at -20 LUFS integrated (or lower for the peak) |
+| music | -28 LUFS integrated | placeholder, no music test yet |
+
+The targets and their derivation are in one place, `managers/loudness.py`.
+
+### Import from sound-gen
+
+`import-sound-gen` reads `~/claude_code/tasks/sound-gen` and never writes to it.
+- **One at a time:** the whole import holds an exclusive `flock` on
+  `$RPGHOME_STATE/locks/catalog-import.lock`. A second import waits for the first.
+- **Async:** `managers/library.py` is async where it touches the catalog. The blocking work
+  (reading sound-gen, hashing, copying, ffmpeg, waiting for the lock) runs in worker threads
+  (`asyncio.to_thread`), so a server's event loop is never blocked for long. The `rpghome`
+  commands run it with `asyncio.run`.
+- **Safe targets:** names from the sound-gen metadata may contain only letters, digits, `_`,
+  `-` and `.`, with no `/` and no `..`. Every target is resolved before anything is written,
+  and it must stay inside `generated/` (MOSS) or `epidemic/` (Epidemic) of the data folder.
+  A bad row (unsafe name, unknown line, missing field, broken JSON) is skipped with a message,
+  and the rest is imported.
+- **Copies:** files are copied into the layout above, through a uniquely named temp file. Each
+  clip records the SHA-256 of its copy (`sha256`). On a re-import:
+
+  | data-folder file | what happens |
+  |------------------|--------------|
+  | missing | copied, measured |
+  | matches the recorded hash, same as the source | nothing |
+  | matches the recorded hash, source changed | copied again, measured again, row updated |
+  | differs from the recorded hash, identical to the source | adopted: our copy from an interrupted import; measured, new hash recorded |
+  | differs from the recorded hash and from the source | **kept**, reported ("changed in the data folder, kept"); its row is not updated |
+  | there, but not a file the catalog imported, and not the source | **kept**, reported, not imported |
+
+  Audio is not in git, so a copy that was changed in the data folder could not be recovered:
+  it is never overwritten.
+  A source file that ffprobe/ffmpeg cannot read is skipped with a message (and a copy made in
+  that run is removed), and the rest is imported.
+- **Clips:** the 20 round-1 MOSS clips (`results/moss.jsonl`), the 48 grid clips
+  (`results/moss_grid.jsonl`), the 8 MOSS spots (`results/spots_moss.jsonl`), the 10
+  Epidemic references (`samples/epidemic/index.json`, the `pick` of each line) and the 6
+  Epidemic spots (`samples/spots_epidemic/index.jsonl`).
+- **Source details:** for MOSS, the prompt, seed, steps, cfg, condition (grid condition, or
+  `short`/`detailed` in round 1, `default` for spots) and the negative prompt. For Epidemic,
+  the id and title.
+- **Kinds and pools** come from the line name (`LINES` in `managers/library.py`):
+
+  | pool | lines |
+  |------|-------|
+  | `cave.bed` | `cave_ambience` (bed) |
+  | `cave.drops` | `drop`, `drips` (spot) |
+  | `cave.stones` | `pebbles`, `rockfall` (spot) |
+  | `tavern.bed` | `tavern_ambience` (bed) |
+  | `storm.rain` | `storm_rain` (bed; these clips carry rain and thunder together) |
+  | `swords.clash` | `sword_clash` (fx) |
+  | `storm.thunder` | **empty**: sound-gen has no separate thunder clips |
+
+  `forest_fire` is a bed; `shiba_yelp`, `ravens_takeoff`, `laser_beam`, `door_creak` and
+  `dragon_roar` are fx. None of them is in a pool.
+- **Tags:** keywords in the line name, the MOSS prompt and the Epidemic title map to category
+  tags where it is obvious (`KEYWORDS`: `cave`/`underground` -> `place:cave`, `drip`/`water` ->
+  `source:water`, `thunder` -> `source:thunder` + `weather:storm`, ...). The spot lines get
+  `place:cave` (they were made for the cave demo).
+  - Free tags come from the line words (`ambience`, `drop`, `rockfall`), Epidemic's category,
+    subcategory and tags, and the round (`blind-round1`, `blind-round2`, `spot-demo`,
+    `short-prompt`/`detailed-prompt`).
+  - Every clip also gets `batch:sound-gen` and `use:rpg|film` (from `tests/sfx.json`).
+- **Perspective / dry:**
+  - `close` when the text says "close up" or "close to", and for the MOSS rockfalls, which
+    the user heard as far too close although the prompt says "distant". Otherwise unknown.
+  - `dry` is true when the prompt says "dry", and for the Epidemic stones (`spots_demo.py`:
+    "Epidemic's stones are dry recordings"). It is false when the text mentions echo, reverb
+    or a cave. Otherwise unknown.
+- **Ratings:**
+  - Round 2 (`blind_grid_key.json` + `blind_grid_votes.txt`) gives 1-5 per clip.
+  - Round 1 (`blind_key.json` + `blind_votes.txt`) had best/worst picks among the three
+    clips of a line. The best becomes **4**, the worst **2**, the middle one gets no rating.
+    Round 1 is relative, so 4 and 2 are the clear part: a pick beat, or lost to, two
+    alternatives. Where both rounds rated a clip (four Epidemic references), round 2 wins.
+  - The spots were never rated. They stay unrated, with the user's spot-demo verdict
+    (paraphrased in `NEXT.md`) in their notes.
+  - `notes` hold, per round, the clip's blind number, its result and the user's remark on the
+    line, verbatim (Polish). The numbers in the remarks can then be resolved.
+  - Status: a rating of 3 or more gives `accepted`; a lower rating or none gives `review`.
+- **Re-running** changes nothing when the source did not change: no duplicates, no export diff.
+  When a clip already exists:
+  - what comes from the file and the source is refreshed: path, title, source details,
+    license, stream info, loudness, hash;
+  - each clip also stores the values the import gave its user-editable fields (`imported`:
+    kind, tags, pools, perspective, dry, loopable, rating, notes, status). A field whose
+    catalog value still equals its imported value was not edited, and it gets the new
+    import's value: a corrected votes file reaches the catalog. A field the user changed
+    keeps the user's value. If the user changed the rating, the status is kept too;
+  - the gain follows the resulting kind.
+
+  Each row is read again and written inside the import's write transaction, so an edit made
+  while files were being measured is merged, not lost. All copying and measuring happens before
+  that transaction: the write batch is short and never spans ffmpeg.
 
 ## Roles and permissions
 
@@ -135,9 +366,11 @@ scripts/start.sh, stop.sh, status.sh   start / stop / status of broker and engin
 scripts/engine.sh           runs the engine in the foreground (launchd calls it)
 scripts/launchd/engine.plist.in        launchd job template, filled by start.sh
 examples/cave.json          a scene for the engine (the cave: bed, spots, reverb), see "Engine"
+migrations/, alembic.ini    Alembic migrations of the clip catalog, see "Library"
 src/rpghome/                the app package, in layers (below)
 src/rpghome_engine/         the engine package: the native audio process (see "Engine")
-tests/                      pytest, mirrors the packages (core/, engine/, cli/);
+tests/                      pytest, mirrors the packages (core/, models/, repositories/, infra/,
+                            managers/, engine/, cli/); audio.py: synthetic WAVs, mini sound-gen;
                             test_setup_sh.py, test_scripts.py (fake docker/launchctl/nc)
 ```
 
@@ -147,9 +380,10 @@ Package layers (`src/rpghome/`):
 core/          config.py (paths and settings from the environment), errors.py (RpgHomeError),
                logs.py (setup_logging: a rotated log file, 5 MB × 3, for each process)
 models/        domain data: scene, overlay, fx, pool, clip, engine commands and state, roles;
-               the rule: pydantic v2 models: frozen, extra fields forbidden, JSON through
-               model_dump(mode="json") (roles.py is not converted yet)
-repositories/  persistence: catalog (SQLite + catalog.jsonl), scene files, git of the data folder
+               the rule: pydantic v2 models: frozen, extra fields forbidden, changes through
+               model_copy(update=...), JSON through model_dump(mode="json") / model_validate
+repositories/  persistence: catalog (SQLAlchemy async on SQLite, ORM tables, catalog.jsonl),
+               scene files, git of the data folder
 managers/      application logic: scene loading and checks, catalog import, permissions
                (roles.toml: the default roles config shipped with the package)
 bus/           MQTT: Bus interface, MqttBus, InMemoryBus, topics

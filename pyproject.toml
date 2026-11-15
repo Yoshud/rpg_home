@@ -5,10 +5,13 @@ description = "Local sound-scene player for tabletop RPG sessions at home"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "aiosqlite>=0.22.1",
+    "alembic>=1.20.1",
     "numpy>=2.5.4",
     "pydantic>=2.14.3",
     "sounddevice>=0.5.6",
     "soundfile>=0.14.0",
+    "sqlalchemy[asyncio]>=2.1.8",
     "typer>=0.29.1",
 ]
 
@@ -26,6 +29,10 @@ module-name = ["rpghome", "rpghome_engine"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# A forgotten `await` fails the test instead of passing silently.
+filterwarnings = ["error:coroutine .* was never awaited:RuntimeWarning"]
 
 [tool.ruff]
 line-length = 100
@@ -37,5 +44,6 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 [dependency-groups]
 dev = [
     "pytest>=9.2.0",
+    "pytest-asyncio>=1.5.0",
     "ruff>=0.17.5",
 ]
