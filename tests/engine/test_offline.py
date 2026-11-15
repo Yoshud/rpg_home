@@ -135,7 +135,12 @@ def test_gains_are_applied(rig, data):
     rig.render(2)
     assert amp_at(rig.out, 400, 3.5) == pytest.approx(A * 10 ** (-12 / 20), rel=0.01)
     levels = rig.engine.status()["levels"]
-    assert levels == {"master_gain_db": -4.0, "bed_gain_db": 0.0, "scene_gain_db": -2.0}
+    assert levels == {
+        "master_gain_db": -4.0,
+        "bed_gain_db": 0.0,
+        "scene_gain_db": -2.0,
+        "density": 1.0,
+    }
 
 
 def test_limiter_never_passes_the_ceiling(rig, data):
@@ -287,7 +292,7 @@ def test_status_reports_the_hold_and_measurements(rig, data):
 
 
 def test_set_rejects_unknown_names_and_bad_values(rig):
-    with pytest.raises(EngineError, match="unknown level"):
+    with pytest.raises(EngineError, match="unknown setting"):
         rig.engine.set("volume", 0)
     with pytest.raises(EngineError, match="within"):
         rig.engine.set("master_gain_db", 100)

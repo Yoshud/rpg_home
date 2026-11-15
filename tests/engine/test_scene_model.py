@@ -4,7 +4,16 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from rpghome.models.scene import Bed, ClipRef, Scene, SceneError, scene_from_data, scene_from_json
+from rpghome.models.scene import (
+    Bed,
+    ClipRef,
+    Reverb,
+    Scene,
+    SceneError,
+    Spots,
+    scene_from_data,
+    scene_from_json,
+)
 
 EXAMPLES = Path(__file__).parents[2] / "examples"
 
@@ -34,6 +43,8 @@ def test_json_round_trip():
             "gain_db": -2.0,
         },
         "gain_db": 1.0,
+        "spots": [],
+        "reverb": None,
     }
 
 
@@ -48,6 +59,9 @@ def test_the_example_scene_loads():
     scene = scene_from_json((EXAMPLES / "cave.json").read_bytes())
     assert scene.name == "cave" and len(scene.bed.clips) == 3
     assert scene.bed.hold_s == (150.0, 210.0)
+    assert [s.name for s in scene.spots] == ["drops", "stones"]
+    assert scene.spots[1].distance_m == 4 and scene.reverb == Reverb()
+    assert all(s.source_weights == {"moss": 3, "epidemic": 1} for s in scene.spots)
 
 
 def test_defaults():
@@ -127,3 +141,150 @@ def test_errors_list_every_field():
 def test_invalid_json_is_a_scene_error():
     with pytest.raises(SceneError, match="Invalid JSON"):
         scene_from_json("{nope")
+
+
+def spots_scene():
+    drops = Spots(
+        name="drops",
+        clips=(
+            ClipRef(path="spots_moss/drop.wav", gain_db=2.5, source="moss", perspective="close"),
+            ClipRef(
+                path="spots_epidemic/drop_a.wav",
+                gain_db=-1,
+                source="epidemic",
+                perspective=3,
+                dry=True,
+            ),
+        ),
+        interval_s=(1.5, 12),
+        mean_interval_s=4,
+        gain_db=(-10, -2),
+        pitch_semitones=2,
+        source_weights={"moss": 3, "epidemic": 1},
+        slice=True,
+    )
+    stones = Spots(name="stones", clips=(ClipRef(path="r.wav"),), interval_s=(15, 80), distance_m=6)
+    return Scene(name="cave", spots=(drops, stones), reverb=Reverb(decay_s=2, wet_db=-12, seed=5))
+
+
+def test_spots_and_reverb_round_trip():
+    scene = spots_scene()
+    data = json.loads(json.dumps(scene.model_dump(mode="json")))
+    assert scene_from_data(data) == scene
+    assert scene_from_json(json.dumps(data)) == scene
+    assert data["spots"][0]["clips"][1] == {
+        "path": "spots_epidemic/drop_a.wav",
+        "gain_db": -1.0,
+        "source": "epidemic",
+        "perspective": 3.0,
+        "dry": True,
+    }
+    assert data["spots"][1] == {
+        "name": "stones",
+        "clips": [{"path": "r.wav", "gain_db": 0.0}],
+        "interval_s": [15.0, 80.0],
+        "mean_interval_s": 47.5,
+        "gain_db": [0.0, 0.0],
+        "pitch_semitones": 0.0,
+        "pan": 0.8,
+        "distance_m": 6.0,
+        "source_weights": {},
+        "slice": False,
+    }
+    assert data["reverb"] == {"decay_s": 2.0, "wet_db": -12.0, "seed": 5}
+
+
+def test_spots_defaults_and_old_scenes_load():
+    scene = scene_from_data({"name": "s", "bed": {"clips": [{"path": "c.wav"}]}})
+    assert scene.spots == () and scene.reverb is None
+    assert scene.bed.clips[0].model_dump(mode="json") == {"path": "c.wav", "gain_db": 0.0}
+    clip = scene.bed.clips[0]
+    assert (clip.source, clip.perspective, clip.dry) == (None, None, False)
+    sp = Spots.model_validate({"name": "d", "clips": [{"path": "a.wav"}], "interval_s": [2, 6]})
+    assert sp.mean_interval_s == 4.0 and sp.gain_db == (0.0, 0.0) and sp.pan == 0.8
+    assert (sp.pitch_semitones, sp.distance_m, sp.source_weights, sp.slice) == (0, None, {}, False)
+    assert Reverb.model_validate({}) == Reverb(decay_s=2.2, wet_db=-10.0, seed=3)
+    assert scene_from_data({"name": "s", "reverb": None}).reverb is None
+
+
+def test_spots_are_hashable():
+    assert hash(spots_scene()) == hash(spots_scene())
+
+
+def test_clip_distance_from_perspective():
+    distances = [ClipRef(path="a", perspective=p).distance_m for p in ("close", "medium", "far")]
+    assert distances == [1.0, 5.0, 20.0]
+    assert ClipRef(path="a").distance_m == 1.0  # unknown = close
+    assert ClipRef(path="a", perspective=7).distance_m == 7.0
+
+
+def test_weights_default_to_one_for_unlisted_sources():
+    sp = Spots(
+        name="d",
+        clips=(ClipRef(path="a", source="moss"), ClipRef(path="b")),
+        interval_s=(1, 2),
+        source_weights={"moss": 3},
+    )
+    assert [sp.weight(c) for c in sp.clips] == [3.0, 1.0]
+
+
+SPOT = {"name": "d", "clips": [{"path": "a.wav"}], "interval_s": [1, 2]}
+
+
+@pytest.mark.parametrize(
+    ("spot", "message"),
+    [
+        ({"name": " "}, "spots.0.name: .*non-empty"),
+        ({"interval_s": [0, 2]}, r"spots.0.interval_s: .*0 < min <= max"),
+        ({"interval_s": [3, 2]}, r"spots.0.interval_s: .*0 < min <= max"),
+        ({"interval_s": [1]}, "spots.0.interval_s.1: Field required"),
+        ({"interval_s": None}, "spots.0.interval_s: Input should be a valid tuple"),
+        ({"mean_interval_s": -1}, "spots.0.mean_interval_s: Input should be greater than 0"),
+        ({"gain_db": [0, -5]}, "spots.0.gain_db: .*min <= max"),
+        ({"gain_db": [-100, 0]}, "spots.0.gain_db.0: Input should be greater than or equal"),
+        ({"pitch_semitones": 30}, "spots.0.pitch_semitones: Input should be less than"),
+        ({"pan": 1.5}, "spots.0.pan: Input should be less than"),
+        ({"pan": "0.5"}, "spots.0.pan: Input should be a valid number"),
+        ({"distance_m": 0}, "spots.0.distance_m: Input should be greater than 0"),
+        (
+            {"source_weights": {"freesound": 1}},
+            r"spots.0.source_weights.freesound.\[key\]: Input should be",
+        ),
+        ({"source_weights": {"moss": -1}}, "spots.0.source_weights.moss: .*greater than"),
+        ({"source_weights": {"other": 0}}, "spots.0: Value error, every clip has source weight 0"),
+        ({"slice": "yes"}, "spots.0.slice: Input should be a valid boolean"),
+        ({"clips": []}, "spots.0.clips: Tuple should have at least 1 item"),
+        ({"clips": [{"path": "a.wav", "source": "web"}]}, "spots.0.clips.0.source: Input should"),
+        (
+            {"clips": [{"path": "a.wav", "perspective": "near"}]},
+            "spots.0.clips.0.perspective: Value error, perspective must be close, medium, far "
+            "or metres within 0..1000, got 'near'",
+        ),
+        ({"clips": [{"path": "a.wav", "perspective": -2}]}, "clips.0.perspective: .*got -2;"),
+        ({"clips": [{"path": "a.wav", "perspective": 0}]}, "clips.0.perspective: .*got 0;"),
+        ({"clips": [{"path": "a.wav", "perspective": True}]}, "spots.0.clips.0.perspective"),
+        ({"clips": [{"path": "a.wav", "dry": 1}]}, "spots.0.clips.0.dry: Input should be a valid"),
+        ({"volume": 1}, "spots.0.volume: Extra inputs are not permitted"),
+    ],
+)
+def test_invalid_spots_are_rejected(spot, message):
+    with pytest.raises(SceneError, match=message):
+        scene_from_data({"name": "s", "spots": [{**SPOT, **spot}]})
+
+
+@pytest.mark.parametrize(
+    ("data", "message"),
+    [
+        ({"name": "s", "spots": [SPOT, SPOT]}, "spots: Value error, spots names must be unique"),
+        ({"name": "s", "spots": {}}, "spots: Input should be a valid tuple"),
+        ({"name": "s", "reverb": {"decay_s": 0}}, "reverb.decay_s: Input should be greater"),
+        ({"name": "s", "reverb": {"wet_db": 50}}, "reverb.wet_db: Input should be less"),
+        ({"name": "s", "reverb": {"seed": 1.5}}, "reverb.seed: Input should be a valid integer"),
+        ({"name": "s", "reverb": {"seed": True}}, "reverb.seed: Input should be a valid integer"),
+        ({"name": "s", "reverb": {"seed": -1}}, "reverb.seed: Input should be greater"),
+        ({"name": "s", "reverb": {"size": 1}}, "reverb.size: Extra inputs are not permitted"),
+    ],
+)
+def test_invalid_scene_spots_and_reverb(data, message):
+    with pytest.raises(SceneError, match=message):
+        scene_from_data(data)

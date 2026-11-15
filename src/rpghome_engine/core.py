@@ -26,6 +26,7 @@ from rpghome_engine.bed import BedPlayer
 from rpghome_engine.clips import EngineError, LoopClip, db_to_gain, load_loop_clip
 from rpghome_engine.memory import MemoryPin, NoPin
 from rpghome_engine.mixer import Mixer
+from rpghome_engine.spots import Room, SpotSound, SpotsPlayer, load_spot_sounds
 from rpghome_engine.stats import Timings
 
 log = logging.getLogger("rpghome.engine")
@@ -40,12 +41,17 @@ LATE_HEADROOM_S = 0.002  # a block that reaches the DAC sooner than this after n
 MIN_FADE_S = 0.01  # even a "cut" is a 10 ms fade, never a click
 
 LEVELS = ("master_gain_db", "bed_gain_db")
+SETTINGS = (*LEVELS, "density")
+DENSITY_RANGE = (0.1, 10.0)
+TIMELINE_SPOTS = 20000  # the latest spot events kept for timeline (a day of drips)
 
 
 @dataclass
 class _LoadedScene:
     scene: Scene
     bed_clips: list[LoopClip] = field(default_factory=list)
+    spot_sounds: list[list[SpotSound]] = field(default_factory=list)  # per spot layer
+    room: Room | None = None
 
 
 @dataclass
@@ -57,8 +63,15 @@ class _Run:
     start: int
     bed: BedPlayer | None
     bed_gain_db: float
+    spots: list[SpotsPlayer] = field(default_factory=list)
+    density: float = 1.0
     released: bool = False
+    ends: int | None = None  # end of the fade-out, once released
     logged: int = 0  # bed history entries already logged
+
+
+def _spots_layer(name: str) -> str:
+    return f"spots:{name}"
 
 
 def _db(gain: float) -> float:
@@ -98,6 +111,7 @@ class Engine:
         self._next_sid = 1
         self._master_gain_db = 0.0
         self._timeline: collections.deque = collections.deque(maxlen=10000)
+        self._spot_timeline: collections.deque = collections.deque(maxlen=TIMELINE_SPOTS)
         self.callback_times = Timings()
         self.control_times = Timings()
         self.underruns = 0  # device underflows, counted by the device callback
@@ -114,6 +128,7 @@ class Engine:
         self._dac_ref = 0.0  # DAC time of the last callback where it changed
         self._frames_since_ref = 0  # frames rendered from that callback on
         self.cycles = 0
+        self._spot_count = 0  # spot events started so far
         self._bad_logged = 0
 
     # -- command API (any thread) ---------------------------------------------------
@@ -139,12 +154,17 @@ class Engine:
 
     def set(self, name: str, value: float) -> None:
         """Set a level: master_gain_db, or bed_gain_db (the bed of the current scene;
-        a new scene starts at its own bed gain_db)."""
-        if name not in LEVELS:
-            raise EngineError(f"unknown level {name!r}; known: {', '.join(LEVELS)}")
+        a new scene starts at its own bed gain_db); or density, the multiplier of the
+        current scene's spot rate (a new scene starts at 1)."""
+        if name not in SETTINGS:
+            raise EngineError(f"unknown setting {name!r}; known: {', '.join(SETTINGS)}")
         if isinstance(value, bool) or not isinstance(value, int | float):
             raise EngineError(f"{name} must be a number, got {value!r}")
-        if not MIN_GAIN_DB <= value <= MAX_GAIN_DB:
+        if name == "density":
+            lo, hi = DENSITY_RANGE
+            if not lo <= value <= hi:
+                raise EngineError(f"density must be within {lo:g}..{hi:g}, got {value}")
+        elif not MIN_GAIN_DB <= value <= MAX_GAIN_DB:
             raise EngineError(f"{name} must be within {MIN_GAIN_DB:g}..{MAX_GAIN_DB:g} dB")
         self._command(("set", name, float(value)))
 
@@ -162,7 +182,9 @@ class Engine:
                     "master_gain_db": self._master_gain_db,
                     "bed_gain_db": run.bed_gain_db if run and run.scene.bed else None,
                     "scene_gain_db": run.scene.gain_db if run else None,
+                    "density": run.density if run else None,
                 },
+                "spot_layers": [p.spots.name for p in run.spots] if run else [],
                 "fading_out": sorted(r.scene.name for r in self._runs.values() if r.released),
             }
             if run and run.bed:
@@ -192,6 +214,7 @@ class Engine:
                 "late_events": m.late_events,
                 "bad_messages": m.bad_messages,
                 "planning_cycles": self.cycles,
+                "spot_events": self._spot_count,
                 "timings_ms": {
                     "control": self.control_times.summary_ms(),
                     "callback": self.callback_times.summary_ms(),
@@ -206,6 +229,15 @@ class Engine:
         with self._lock:
             self._collect_timeline()
             return list(self._timeline)
+
+    def spot_timeline(self) -> list[dict]:
+        """The spot events started so far (the latest TIMELINE_SPOTS): scene, layer,
+        start_s, clip (path, #slice when sliced), source, gain_db, pan, pitch_semitones,
+        clip_distance_m, distance_m, attenuation_db, lowpass_hz (None: no filter) and
+        wet_db (wet level against the direct sound; None: no reverb)."""
+        with self._lock:
+            self._collect_timeline()
+            return list(self._spot_timeline)
 
     # -- audio thread -----------------------------------------------------------------
 
@@ -282,7 +314,16 @@ class Engine:
                         self.mixer.post("events", sid, "bed", events)
                     if run.bed.done:
                         run.bed = None
-                if run.released and run.bed is None:
+                for player in run.spots:
+                    if player.released:
+                        continue
+                    layer = _spots_layer(player.spots.name)
+                    events = player.plan(until)
+                    if events:
+                        self.mixer.post("events", sid, layer, events)
+                    self.mixer.post("covered", sid, layer, until)
+                if run.released and run.bed is None and clock >= run.ends:
+                    self._collect_timeline()  # spots that started during the fade-out
                     del self._runs[sid]  # the mixer drops its bus when the fade ends
             self._collect_timeline()
             self.cycles += 1
@@ -318,6 +359,10 @@ class Engine:
                         pin=self.memory.pin,
                     )
                 )
+        for spots in scene.spots:
+            loaded.spot_sounds.append(load_spot_sounds(self.data_dir, spots, self.rate))
+        if scene.spots:
+            loaded.room = Room(scene.reverb, self.rate, pin=self.memory.pin)
         return loaded
 
     def _apply(self, cmd: tuple) -> None:
@@ -336,6 +381,15 @@ class Engine:
             log.info("stop (fade %.1f s)", cmd[1])
         elif kind == "set":
             _, name, value = cmd
+            if name == "density":
+                if self._current is None:
+                    log.warning("set density = %g ignored: no scene", value)
+                    return
+                self._current.density = value
+                for player in self._current.spots:
+                    player.density = value
+                log.info("set density = %g", value)
+                return
             if name == "master_gain_db":
                 self._master_gain_db = value
                 self.mixer.post("master", db_to_gain(value))
@@ -354,6 +408,12 @@ class Engine:
             if run.released:
                 continue
             run.released = True
+            run.ends = at + n
+            for player in run.spots:
+                layer = _spots_layer(player.spots.name)
+                if player.release(at):
+                    self.mixer.post("cancel", run.sid, layer, at)
+                self.mixer.post("covered", run.sid, layer, run.ends)
             if run.bed is not None:
                 cut = run.bed.release(at, at + n)
                 if cut is not None:
@@ -370,6 +430,10 @@ class Engine:
             bed = BedPlayer(scene.bed, loaded.bed_clips, rng, at, self.rate, pin=self.memory.pin)
             layers["bed"] = db_to_gain(scene.bed.gain_db)
         run = _Run(sid, scene, at, bed, scene.bed.gain_db if scene.bed else 0.0)
+        for spots, sounds in zip(scene.spots, loaded.spot_sounds, strict=True):
+            player_rng = random.Random(rng.getrandbits(64))
+            run.spots.append(SpotsPlayer(spots, sounds, loaded.room, player_rng, at, self.rate))
+            layers[_spots_layer(spots.name)] = 1.0
         self._runs[sid] = run
         self._current = run
         self.mixer.post("add_scene", sid, at, db_to_gain(scene.gain_db), layers)
@@ -379,6 +443,14 @@ class Engine:
         """Log the clips that have started (planned ones may still be cancelled)."""
         clock = self.mixer.clock
         for run in self._runs.values():
+            for player in run.spots:
+                while player.history and player.history[0]["start"] <= clock:
+                    entry = player.history.popleft()
+                    start = entry.pop("start")
+                    item = {"scene": run.scene.name, "start_s": start / self.rate, **entry}
+                    self._spot_timeline.append(item)
+                    self._spot_count += 1
+                    log.debug("spot %r: %s", run.scene.name, item)
             if run.bed is None:
                 continue
             for entry in run.bed.history[run.logged :]:

@@ -2,14 +2,153 @@
   "name": "cave",
   "bed": {
     "clips": [
-      {"path": "moss_grid/cave_ambience__cfg3__s2.wav", "gain_db": -8.0},
-      {"path": "moss_grid/cave_ambience__default__s3.wav", "gain_db": 0.2},
-      {"path": "moss_grid/cave_ambience__default__s2.wav", "gain_db": -10.0}
+      {
+        "path": "moss_grid/cave_ambience__cfg3__s2.wav",
+        "gain_db": -8.0
+      },
+      {
+        "path": "moss_grid/cave_ambience__default__s3.wav",
+        "gain_db": 0.2
+      },
+      {
+        "path": "moss_grid/cave_ambience__default__s2.wav",
+        "gain_db": -10.0
+      }
     ],
-    "hold_s": [150, 210],
+    "hold_s": [
+      150,
+      210
+    ],
     "crossfade_s": 35,
     "loop_crossfade_s": 4,
     "gain_db": 0
   },
-  "gain_db": 0
+  "gain_db": 0,
+  "spots": [
+    {
+      "name": "drops",
+      "clips": [
+        {
+          "path": "spots_moss/drips__s2.wav",
+          "gain_db": 4.5,
+          "source": "moss"
+        },
+        {
+          "path": "spots_moss/drop__s1.wav",
+          "gain_db": 14.8,
+          "source": "moss"
+        },
+        {
+          "path": "spots_moss/drop__s2.wav",
+          "gain_db": -2.4,
+          "source": "moss"
+        },
+        {
+          "path": "spots_epidemic/drop_a.wav",
+          "gain_db": -5.3,
+          "source": "epidemic",
+          "perspective": "medium"
+        },
+        {
+          "path": "spots_epidemic/drop_b.wav",
+          "gain_db": -0.2,
+          "source": "epidemic",
+          "perspective": "medium"
+        }
+      ],
+      "interval_s": [
+        1.5,
+        12
+      ],
+      "mean_interval_s": 4,
+      "gain_db": [
+        -10,
+        -2
+      ],
+      "pitch_semitones": 2,
+      "pan": 0.8,
+      "source_weights": {
+        "moss": 3,
+        "epidemic": 1
+      },
+      "slice": true
+    },
+    {
+      "name": "stones",
+      "clips": [
+        {
+          "path": "spots_moss/pebbles__s1.wav",
+          "gain_db": -8.0,
+          "source": "moss",
+          "perspective": "close"
+        },
+        {
+          "path": "spots_moss/pebbles__s2.wav",
+          "gain_db": -7.9,
+          "source": "moss",
+          "perspective": "close"
+        },
+        {
+          "path": "spots_moss/rockfall__s1.wav",
+          "gain_db": -6.5,
+          "source": "moss",
+          "perspective": "close"
+        },
+        {
+          "path": "spots_moss/rockfall__s2.wav",
+          "gain_db": -8.0,
+          "source": "moss",
+          "perspective": "close"
+        },
+        {
+          "path": "spots_epidemic/pebbles_a.wav",
+          "gain_db": -3.7,
+          "source": "epidemic",
+          "perspective": "close",
+          "dry": true
+        },
+        {
+          "path": "spots_epidemic/pebbles_b.wav",
+          "gain_db": -7.1,
+          "source": "epidemic",
+          "perspective": "close",
+          "dry": true
+        },
+        {
+          "path": "spots_epidemic/rockfall_a.wav",
+          "gain_db": 1.2,
+          "source": "epidemic",
+          "perspective": "close",
+          "dry": true
+        },
+        {
+          "path": "spots_epidemic/rockfall_b.wav",
+          "gain_db": 2.3,
+          "source": "epidemic",
+          "perspective": "close",
+          "dry": true
+        }
+      ],
+      "interval_s": [
+        15,
+        80
+      ],
+      "mean_interval_s": 35,
+      "gain_db": [
+        -6,
+        0
+      ],
+      "pan": 0.8,
+      "distance_m": 4.0,
+      "source_weights": {
+        "moss": 3,
+        "epidemic": 1
+      }
+    }
+  ],
+  "reverb": {
+    "decay_s": 2.2,
+    "wet_db": -10,
+    "seed": 3
+  }
 }

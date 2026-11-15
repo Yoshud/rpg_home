@@ -8,7 +8,8 @@ started and stopped with one script.
 
 This repo currently contains the layered `rpghome` package, the MQTT broker (mosquitto in
 docker compose), the start/stop scripts, and the audio engine run by launchd (the
-`rpghome_engine` package): its core, the audio path and the ambient bed (see
+`rpghome_engine` package): its core, the audio path, the ambient bed, spot sounds with
+distance and the scene reverb (see
 [Engine](#engine)); it does not listen to the bus yet.
 
 ## Setup
@@ -133,7 +134,7 @@ scripts/setup.sh            first-time setup, one function per step
 scripts/start.sh, stop.sh, status.sh   start / stop / status of broker and engine
 scripts/engine.sh           runs the engine in the foreground (launchd calls it)
 scripts/launchd/engine.plist.in        launchd job template, filled by start.sh
-examples/cave.json          a scene for the engine (the cave bed), see "Engine"
+examples/cave.json          a scene for the engine (the cave: bed, spots, reverb), see "Engine"
 src/rpghome/                the app package, in layers (below)
 src/rpghome_engine/         the engine package: the native audio process (see "Engine")
 tests/                      pytest, mirrors the packages (core/, engine/, cli/);
@@ -205,9 +206,11 @@ The broker listens only on `127.0.0.1`; containers on the compose network reach 
 ## Engine
 
 The engine (`rpghome_engine`) is a separate process that only plays audio. It gets a ready
-scene (`rpghome.models.scene`: `Scene` → `Bed` → `ClipRef`s, pydantic models; JSON via
-`scene_from_data` / `scene_from_json`, which raise `SceneError` naming each bad field, as
-in `bed.hold_s: ...`, and `model_dump(mode="json")`) whose clip paths are relative to the data folder and whose levels are
+scene (`rpghome.models.scene`: `Scene` → `Bed`, `Spots` layers and a `Reverb`, each with
+`ClipRef`s, pydantic models; JSON via `scene_from_data` / `scene_from_json`, which raise
+`SceneError` naming each bad field, as in `bed.hold_s: ...` or `spots.0.interval_s: ...`,
+and `model_dump(mode="json")`; older files without spots or reverb still load) whose clip
+paths are relative to the data folder and whose levels are
 already resolved; it never reads scene files or the catalog.
 
 ### Architecture
@@ -220,7 +223,8 @@ already resolved; it never reads scene files or the catalog.
   (`bad_messages`) and dropped: the audio thread never raises on a message.
 - **Control thread** (`core.py`): five times per second it applies the queued commands and
   asks each element what it plays in the next 5 s. The bed (`bed.py`) answers with ready
-  buffers (clip slices with gains and fades) and their start samples.
+  buffers (clip slices with gains and fades) and their start samples; each spot layer
+  (`spots.py`) with one ready buffer per event (direct sound plus its reverb tail).
 - **Bed** (version C of the sound-gen loop demo): one clip of the pool, looped end to start
   with an equal-power crossfade of `loop_crossfade_s`, held for a time drawn from `hold_s`,
   then an equal-power crossfade of `crossfade_s` into another clip, never the same one twice
@@ -228,6 +232,74 @@ already resolved; it never reads scene files or the catalog.
   so a clip is heard for hold + `crossfade_s`. A pool of one clip has no holds: it loops
   (loop crossfades only), since a crossfade into itself would add correlated material (up
   to +3 dB). Clip order and holds come from a seeded `random.Random`.
+- **Spots** (`rpghome_engine/spots.py`, the sound-gen spots demo): each `Spots` layer
+  (`Scene.spots`, a pydantic model in `rpghome.models.scene`) plays random one-shot events
+  on its own layer bus (`spots:<name>`).
+  - *Model*: `name` (unique in the scene), `clips` (at least one), `interval_s` (`[min,
+    max]`, 0 < min <= max), `mean_interval_s` (> 0, default the middle of `interval_s`),
+    `gain_db` (`[min, max]`, -90..24 dB, default `[0, 0]`), `pitch_semitones` (0..24,
+    default 0), `pan` (0..1, default 0.8), `distance_m` (0..1000 m, default `null`),
+    `source_weights` (`moss`, `epidemic`, `other`, each >= 0, default `{}`; some clip must
+    weigh more than 0) and `slice` (default false). Each `ClipRef` may carry `source`,
+    `perspective` and `dry`, left out of the JSON when unset. Every error names its field,
+    as in `spots.0.interval_s: ...`.
+  - *Sounds*, prepared once when the scene is set: each clip is read, mixed to mono (a
+    spot is a point source) and, with `slice`, cut into single drops as the demo's
+    `slice_drops` does (onsets 20 dB over the clip's floor, 0.4 s apart, at most 12,
+    0.3-2.5 s each); a clip with no drops is skipped with a warning, a layer with none is
+    an error. Without `slice` the clip's silence (40 dB under its loudest 10 ms) is trimmed.
+    A spot clip shorter than 10 ms is an error from `scene()`.
+  - *Pick*: a source by `source_weights` (a source not listed weighs 1; `{}`: all
+    equal), then one of its sounds; never the sound (clip, or slice of a clip) just
+    played. Picking the source first keeps the source ratio at the weights whatever the
+    number of sounds each one has. A source whose only sound was just played cannot come
+    next; its share is credited to its next chance (taken from the sources with no
+    credit), so MOSS a, b and Epidemic c at 3:1 still give 3:1 (plain renormalisation
+    would give 4:1). When no-repeat makes the weights impossible (one MOSS sound at 3:1)
+    the source gets as close as it can: every other pick.
+  - *Intervals*: exponential with mean `mean_interval_s` (default: the middle of
+    `interval_s`), clamped to `interval_s`, then divided by the scene's density. The
+    first event comes after a uniform draw from `interval_s`. The clamped mean is
+    `lo + mean (e^-lo/mean - e^-hi/mean)`: 4.05 s for 1.5-12 s / mean 4.
+  - *Per event*: gain uniform in `gain_db`, pitch uniform in ±`pitch_semitones`
+    (resampling by linear interpolation: higher is shorter), pan uniform in ±`pan`
+    (equal power, cos/sin). The draws come from a seeded `random.Random` per layer, in a
+    fixed order, so a render depends only on the seed and the commands.
+- **Distance** (`rpghome_engine.spots.distance`): a clip sounds from its
+  `ClipRef.perspective`: `close`, `medium`, `far` = 1, 5, 20 m, or metres (0..1000); none
+  = close. A layer's `distance_m` only moves sounds away: with
+  r = max(1, distance_m / clip distance) (a far clip asked for at 1 m stays as it is):
+  - direct level: `-20 log10(r)` dB, inverse distance, -6 dB per doubling;
+  - low-pass: zero-phase 2nd-order Butterworth magnitude `1 / sqrt(1 + (f/fc)^4)`
+    (-12 dB per octave), `fc = 20 kHz / r^0.8`, at least 500 Hz, none at r = 1:
+    11.5 kHz at r = 2, 6.6 kHz at 4, 5.5 kHz at 5, 1.8 kHz at 20. The FFT is padded by
+    4 / fc (the filter's ringing is under -120 dB after 2 / fc on each side), so the
+    zero-phase ringing never wraps around into the buffer;
+  - reverb: the wet/direct ratio is the scene's `wet_db + 10 log10(r)`, +3 dB per
+    doubling (the direct sound falls 6 dB per doubling, the reverb 3).
+- **Reverb** (`rpghome_engine.spots.Room`): the scene's `reverb` (the `Reverb` model:
+  `decay_s` 0.1-10 s, default 2.2; `wet_db` -90..24, default -10; `seed` an integer >= 0,
+  default 3) is a synthetic stereo impulse response like the demo's `cave_ir`: noise
+  decaying 60 dB over `decay_s`, a one-pole low-pass at ~3 kHz, 12 ms pre-delay, each
+  channel at unit energy. It is
+  generated once when the scene is set. Only spots go through it: the bed carries its own
+  acoustics. Each event's buffer is made in the control thread with one FFT: the
+  (low-passed) mono sound times `pan gain + wet gain × IR` per channel, so it is the
+  clip plus a `decay_s` tail. The wet part is diffuse (both IR channels, at 1/√2 each,
+  so its energy is `wet_db` under the direct sound's). No reverb (`null`): spots play dry.
+  The reverb spectra (complex64, one per FFT size) and low-pass responses (one per FFT
+  size and cutoff) are kept in small LRU caches (3 and 4 entries): 7.8 MB for the cave.
+  Event buffers are pinned in RAM (`MemoryPin`, `mlock`) like the bed's planned buffers
+  (the audio thread reads them), and freed and unpinned in the control thread; the sounds
+  they are made from are read only by the control thread and are not pinned.
+  `dry` on a clip is carried from the catalog; every spot goes through the reverb, as in
+  the demo.
+- **Density**: `Engine.set("density", x)` (`rpghome_engine.core`; 0.1-10, default 1 for each new scene) divides the
+  spot intervals of the current scene. Events already planned (up to 5 s ahead) stay; the
+  interval after the last planned event and all later ones use the new value, and an
+  event is never moved before what is already planned.
+- **Scene switch with spots**: spot events planned past the switch are cancelled (the
+  mixer drops their buffers); those already started fade out with the scene.
 - **Master**: master gain, then a lookahead peak limiter (2.5 ms window, 150 ms release)
   with a ceiling of -1 dBFS (the float32 value just below it) that no sample passes; below
   the ceiling it is a plain delay.
@@ -281,8 +353,14 @@ Thread-safe methods of `rpghome_engine.core.Engine` (the bus calls them in a lat
 |--------|--------------|
 | `scene(scene, transition_s=10)` | loads the clips (a missing or unreadable file raises `EngineError`, and the engine keeps playing), then switches with an equal-power crossfade. The old scene stops planning at once: no new clip starts, material it had planned past the switch is dropped, and what plays fades out. |
 | `stop(fade_s=2)` | fades everything out; then silence |
-| `set(name, value)` | `master_gain_db`, or `bed_gain_db` (the bed of the current scene; the next scene starts at its own bed `gain_db`). With no scene, or a scene without a bed, `bed_gain_db` is ignored with a warning in the log, not kept for later. |
-| `status()` | scene, current clip, `hold_s` (`None` for a one-clip pool) and `hold_elapsed_s`, levels, `seconds_rendered`, `late_callbacks`, `gaps`, `max_gap_ms`, `min_headroom_ms`, `slow_callbacks`, `nonfinite_blocks`, output peak and lowest limiter gain over the last ~2 s and since the start, underruns, starved blocks, late buffers, bad messages, planning cycles, control-cycle and callback times (p50, p95 of the whole run from a fixed log-scale histogram, to about 6 %; exact max; in ms). Reading changes nothing and costs the same (about 20 µs) however long the run: any number of readers can poll. |
+| `set(name, value)` | `master_gain_db`, or `bed_gain_db` (the bed of the current scene; the next scene starts at its own bed `gain_db`), or `density` (0.1-10, the current scene's spot rate; the next scene starts at 1). With no scene, or a scene without a bed, `bed_gain_db` is ignored with a warning in the log, not kept for later; so is `density` with no scene. |
+| `status()` | scene, current clip, `hold_s` (`None` for a one-clip pool) and `hold_elapsed_s`, levels (with `density`), `spot_layers`, `spot_events` (started so far), `seconds_rendered`, `late_callbacks`, `gaps`, `max_gap_ms`, `min_headroom_ms`, `slow_callbacks`, `nonfinite_blocks`, output peak and lowest limiter gain over the last ~2 s and since the start, underruns, starved blocks, late buffers, bad messages, planning cycles, control-cycle and callback times (p50, p95 of the whole run from a fixed log-scale histogram, to about 6 %; exact max; in ms). Reading changes nothing and costs the same (about 20 µs) however long the run: any number of readers can poll. |
+
+`timeline()` lists the bed clips started so far. `spot_timeline()` is the spot event log
+(the latest 20000 events that have started): `scene`, `layer`, `start_s`, `clip` (the path,
+`#n` for slice n), `source`, `gain_db`, `pan`, `pitch_semitones`, `clip_distance_m`,
+`distance_m`, `attenuation_db`, `lowpass_hz` (`null`: no filter) and `wet_db` (wet level
+against the direct sound; `null`: no reverb).
 
 Offline, `OfflineDevice(engine).render(frames)` or `.render_to_file(path, frames)` pull
 blocks the way the callback does and run the control cycle every 0.2 s of rendered time,
@@ -301,7 +379,8 @@ so a render depends only on the seed and the commands. The tests use only this.
 - `--scene`: plays the scene (fading in over `--transition`, default 2 s) until a signal,
   or for `--seconds`. `--offline out.wav` renders `--seconds` into a 24-bit WAV with no
   device. `--report` writes the last `status()` while playing, the measurements
-  (including `seconds_rendered` and `callbacks`) and the bed timeline as JSON, with
+  (including `seconds_rendered` and `callbacks`), the bed timeline and the spot event
+  log (`spot_timeline`) as JSON, with
   `valid: false` and an `invalid_reason` when the output failed or the callback never
   ran, and `degraded: true` with a `degraded_reason` when it played with underruns, late
   callbacks or gaps (what a listener hears as crackles). The minute status line in the
@@ -325,9 +404,19 @@ so a render depends only on the seed and the commands. The tests use only this.
 
 ### Device test
 
-`examples/cave.json` is the cave bed: the three cave clips rated 4-5, with gains from the
-loop demo's version C (the clips' bed levels, the 20th percentile of momentary loudness,
-matched to their median, then one common gain for a -1 dBFS peak). Its paths are relative
+`examples/cave.json` is the cave: the bed is the three cave clips rated 4-5, with gains from
+the loop demo's version C (the clips' bed levels, the 20th percentile of momentary
+loudness, matched to their median, then one common gain for a -1 dBFS peak). Two spot
+layers use the spots demo's version C settings, mostly MOSS with an occasional Epidemic
+sound (weights 3:1): `drops` (sliced MOSS drips and drops and the two Epidemic cave drip
+files, every 1.5-12 s, mean 4 s, -10..-2 dB, ±2 semitones) and `stones` (MOSS pebbles and
+rockfalls, Epidemic's dry stones, every 15-80 s, mean 35 s, -6..0 dB) at `distance_m` 4.
+The demo played the stones as recorded (close, 1 m), and the MOSS rockfall was far too
+close: its loud stones were as loud as the bed. At 4 m they are 12 dB quieter, low-passed at
+6.6 kHz, with the wet/direct ratio at -4 dB instead of -10, which puts them about 11 dB
+under the bed, near the drops' level. Every spot clip's `gain_db` brings its peak (mono) to -8
+dBFS, as the demo did (`drips__s1` is left out: it has no drop the slicer finds, and the
+demo skipped it too). The reverb is the demo's (2.2 s, -10 dB, seed 3). Its paths are relative
 to `~/claude_code/tasks/sound-gen/samples`, so use that as the data folder. 30 minutes on
 the default output device:
 
@@ -343,7 +432,8 @@ mean nothing), `seconds_rendered` (about 1800), then `degraded` and the measurem
 `late_events` (all should be 0), `min_headroom_ms`, the `memory` summary (what was pinned) and `callback_ms` against
 `callback_budget_ms` (10.7 ms). With the lid closed and no external output the run fails
 on purpose: exit 1, `valid: false`. The same command with
-`--offline /tmp/cave.wav` renders it to a file instead.
+`--offline /tmp/cave.wav` renders it to a file instead. The report's `spot_timeline` has
+every spot event of the run.
 
 ### Measurements (offline, Apple Silicon)
 
@@ -355,6 +445,18 @@ device (`RPGHOME_AUDIO_DEVICE=null`, which gives the engine a DAC timeline 20 ms
 for 30 s: control p50 0.065 / p95 0.21 / max 0.51 ms, callback p50 0.043 / p95 0.097 /
 max 0.26 ms, minimum headroom 14.7 ms, no late callbacks, gaps or underruns.
 Real-device numbers come from the device test above.
+
+With spots and reverb, after the memory-pinning core (`tests/engine/test_spots.py`,
+synthetic cave with both spot layers and the reverb): 20 min of engine time, control cycle
+p50 0.022 ms, p95 2.2 ms, max 4.4 ms (5922 cycles; a cycle that prepares an event costs one
+FFT convolution, 2.7 ms p50); 2 h, p50 0.019, p95 2.1, max 14 ms. Callback for the same
+600 s, seed 3: bed only p50 0.0077 / p95 0.0097 ms, with the two spot layers 0.0109 /
+0.0137 ms (two more layer buses, the same per-layer work as the bed's). `examples/cave.json`
+with the real clips, 1800 s offline: preparing an event takes p50 3.2 ms, p95 8.1 ms, max
+19 ms (the 7.7 s Epidemic stones plus a 2.2 s tail), within the 200 ms control period;
+control p50 0.027 ms, p95 2.3 ms, max 19 ms; no starved blocks and no late buffers. These
+are wall-clock times on a busy machine: single cycles and callbacks sometimes take
+80-125 ms and 10-26 ms in one run and not in another with the same seed and the same work.
 
 ## Development
 

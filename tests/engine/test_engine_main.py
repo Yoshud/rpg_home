@@ -121,6 +121,7 @@ def test_offline_renders_the_right_length(env):
     assert r["measurements"]["planning_cycles"] > 10
     assert r["measurements"]["starved_blocks"] == 0
     assert r["bed_timeline"][0]["clip"] == "t.wav"
+    assert r["spot_timeline"] == []  # the scene has no spots
 
 
 def test_seconds_on_the_null_device_writes_a_report(env):

@@ -201,6 +201,7 @@ def build_report(
         },
         "memory": engine.memory.summary(),
         "bed_timeline": engine.timeline(),
+        "spot_timeline": engine.spot_timeline(),
     }
 
 

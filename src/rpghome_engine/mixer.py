@@ -10,6 +10,9 @@ audio thread never raises on a message.
   ("fade", sid, start, length, "in" | "out")   equal-power; "out" starts from the current value
   ("scene_gain", sid, gain) / ("layer_gain", sid, layer, gain) / ("master", gain)
   ("truncate", sid, layer, at)   cut the layer's buffers at sample `at` (it is re-planned)
+  ("cancel", sid, layer, at)     drop the layer's buffers that start at or after `at`
+  ("covered", sid, layer, until) the layer is planned up to `until`, even where it has no
+                                 buffers (spots are silent between events)
 """
 
 import collections
@@ -20,6 +23,7 @@ import numpy as np
 from rpghome_engine.limiter import Limiter
 
 RAMP_S = 0.05  # gain changes glide linearly over this time (no zipper noise)
+_SCENE_MESSAGES = ("events", "fade", "scene_gain", "layer_gain", "truncate", "cancel", "covered")
 
 
 class Ramp:
@@ -192,7 +196,7 @@ class Mixer:
             return
         sb = self.scenes.get(msg[1])
         if sb is None:
-            if kind not in ("events", "fade", "scene_gain", "layer_gain", "truncate"):
+            if kind not in _SCENE_MESSAGES:
                 raise ValueError(f"unknown message {kind!r}")
             return  # the scene already faded out and was dropped
         if kind == "events":
@@ -221,6 +225,16 @@ class Mixer:
             self.graveyard.append(lb.events)  # the cut-off buffers die in the control thread
             lb.events = kept
             lb.covered = min(lb.covered, at)
+        elif kind == "cancel":
+            _, _, layer, at = msg
+            lb = sb.layers[layer]
+            # Buffers are in start order: pop from the end, nothing is built here, and
+            # the dropped buffers die in the control thread.
+            while lb.events and lb.events[-1][0] >= at:
+                self.graveyard.append(lb.events.pop())
+        elif kind == "covered":
+            lb = sb.layers[msg[2]]
+            lb.covered = max(lb.covered, int(msg[3]))
         else:
             raise ValueError(f"unknown message {kind!r}")
 
