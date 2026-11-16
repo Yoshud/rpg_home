@@ -10,6 +10,7 @@ import soundfile as sf
 
 from rpghome.models.scene import Bed, ClipRef, Scene
 from rpghome_engine.clips import EngineError
+from rpghome_engine.core import STOPPING
 
 from .conftest import LEAD, RATE, Rig, amp_at, write_noise, write_tone
 
@@ -247,6 +248,17 @@ def test_clip_too_short_for_the_loop_crossfade(rig, data):
         rig.engine.scene(
             Scene(name="s", bed=Bed(clips=(ClipRef(path="short.wav"),), loop_crossfade_s=4))
         )
+
+
+def test_a_scene_the_caller_is_already_leaving_is_not_applied(rig, data):
+    """`should_stop` is asked after the clips are loaded and before they are handed to the
+    control thread: a load that ends during a shutdown changes nothing (link.py uses this)."""
+    rig.engine.scene(tone_scene(data, [440], hold_s=(100, 100), crossfade_s=1), 0)
+    rig.render(1)
+    with pytest.raises(EngineError, match=re.escape(STOPPING)):
+        rig.engine.scene(tone_scene(data, [880], name="second"), should_stop=lambda: True)
+    assert rig.engine.has_commands is False  # nothing was queued for the control thread
+    assert rig.engine.status()["scene"] == "s"  # the engine still plays what it played
 
 
 def test_other_rates_are_resampled_and_mono_goes_to_both_channels(rig, data):

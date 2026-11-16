@@ -24,5 +24,6 @@ def test_config_invalid(env, monkeypatch):
 
 
 def test_no_deployment_commands():
-    for name in ("up", "down", "status", "logs"):
+    # `status` is a command now (it reads the bus); starting and stopping stays with the scripts.
+    for name in ("up", "down", "logs"):
         assert runner.invoke(cli.app, [name]).exit_code != 0

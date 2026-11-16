@@ -15,6 +15,7 @@ import math
 import random
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ HORIZON_S = 5.0
 LEAD_BLOCKS = 2  # a command takes effect this many blocks after the current clock
 LATE_HEADROOM_S = 0.002  # a block that reaches the DAC sooner than this after now is late
 MIN_FADE_S = 0.01  # even a "cut" is a 10 ms fade, never a click
+STOPPING = "engine is stopping"  # what a caller that is already leaving gets instead of work
 
 LEVELS = ("master_gain_db", "bed_gain_db")
 SETTINGS = (*LEVELS, "density")
@@ -133,11 +135,20 @@ class Engine:
 
     # -- command API (any thread) ---------------------------------------------------
 
-    def scene(self, scene: Scene | dict, transition_s: float = 10.0) -> None:
+    def scene(
+        self,
+        scene: Scene | dict,
+        transition_s: float = 10.0,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> None:
         """Switch to `scene` with an equal-power crossfade of transition_s.
 
         Loads the clips first; raises EngineError (and changes nothing) if one is
-        missing or unreadable.
+        missing or unreadable. `should_stop()` is asked again once they are loaded and
+        before the scene is handed to the control thread: a caller that is already on its
+        way out gets EngineError (STOPPING) instead of a scene that starts playing during
+        its own fade-out.
         """
         if isinstance(scene, dict):
             try:
@@ -145,7 +156,9 @@ class Engine:
             except SceneError as exc:
                 raise EngineError(f"invalid scene: {exc}") from None
         transition_s = self._seconds(transition_s, "transition_s")
-        loaded = self._load(scene)
+        loaded = self._load(scene)  # the slow part, and the only part that is
+        if should_stop is not None and should_stop():
+            raise EngineError(STOPPING)  # the load ended after the caller started leaving
         self._command(("scene", loaded, transition_s))
 
     def stop(self, fade_s: float = 2.0) -> None:

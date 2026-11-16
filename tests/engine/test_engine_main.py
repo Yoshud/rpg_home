@@ -63,6 +63,9 @@ def test_no_arguments_waits_and_stops_cleanly_on_signal(env, sig):
     assert f"data={env.resolve() / 'artifacts'}" in log
     assert f"received {sig.name}, stopping" in log
     assert "engine stopped" in log
+    # nothing listens on 1884: the engine played anyway and kept retrying the broker
+    assert "commands on rpghome/cmd/#" in log
+    assert "cannot reach the broker at 127.0.0.1:1884, retrying in the background" in log
     assert out == ""  # not a TTY: the log goes only to the file
 
 

@@ -1,8 +1,15 @@
 """The engine process: `python -m rpghome_engine`.
 
-Without arguments (how launchd runs it) it opens the output stream, plays silence and
-waits for commands (none arrive until the bus exists) and for SIGTERM / SIGINT.
-For manual and orchestrator tests:
+Without arguments (how launchd runs it) it takes `<state>/engine.lock`, opens the output
+stream, plays silence, and takes its commands over the bus (`rpghome/cmd/#`), publishing
+`rpghome/state`, `rpghome/events` and the retained `rpghome/engine/online` flag - see
+link.py and the README, "Bus". A broker that is not up yet is retried in the
+background: the engine keeps playing silence and does not exit. On SIGTERM / SIGINT it
+publishes `online: false` and the state that ends the run, closes the bus and exits 0.
+A second instance (someone running scripts/engine.sh next to launchd) logs "another engine
+is running" and exits 0.
+
+For manual and orchestrator tests (no bus, no lock):
 
     python -m rpghome_engine --scene scene.json [--seconds N] [--report report.json]
                              [--offline out.wav] [--seed S] [--transition S]
@@ -25,6 +32,8 @@ import threading
 import time
 from pathlib import Path
 
+from rpghome.bus import topics
+from rpghome.bus.mqtt import MqttBus
 from rpghome.core.config import ConfigError, Settings, load_settings
 from rpghome.core.logs import add_stderr, setup_logging
 from rpghome.models.scene import Scene, SceneError, scene_from_json
@@ -37,6 +46,8 @@ from rpghome_engine.devices import (
     OfflineDevice,
     SoundDeviceOutput,
 )
+from rpghome_engine.instance_lock import LOCK_NAME, EngineLock
+from rpghome_engine.link import EngineLink
 from rpghome_engine.memory import MemoryPin, NoPin
 
 log = logging.getLogger("rpghome.engine")
@@ -47,6 +58,9 @@ STATUS_LOG_EVERY_S = 60.0
 STOP_FADE_S = 0.5
 DEFAULT_LATENCY_S = 0.05  # ambience tolerates more; effects need < 100 ms click to sound
 AUDIO_FAILURE_FILE = "engine-audio-failure.json"
+# Short keepalive: a killed engine is noticed by the broker within ~1.5 x this, and its
+# last will sets online: false. On a broker on this machine the pings cost nothing.
+KEEPALIVE_S = 5
 
 
 class _Parser(argparse.ArgumentParser):
@@ -134,6 +148,45 @@ def clear_audio_failure(state_dir: Path) -> None:
         log.warning("cannot remove %s: %s", path, exc)
         return
     log.info("audio output plays again: removed %s", path)
+
+
+def take_engine_lock(settings: Settings) -> EngineLock | None:
+    """The exclusive `<state>/engine.lock`: one engine at a time. None when it is held."""
+    lock = EngineLock(settings.state_dir / LOCK_NAME)
+    try:
+        taken = lock.acquire()
+    except OSError as exc:
+        raise ConfigError(f"cannot use the engine lock {lock.path}: {exc}") from None
+    if not taken:
+        log.info("another engine is running (%s is held), not starting", lock.path)
+        return None
+    return lock
+
+
+def start_link(engine: Engine, settings: Settings) -> EngineLink:
+    """Commands over the bus, with `online: true` retained and `online: false` as the will.
+
+    A broker that is not up yet is retried in the background (the engine plays silence and
+    does not exit - launchd must not loop on it), and nothing is queued behind the outage:
+    after every (re)connect `announce()` publishes `online: true` and the state as it is now.
+    """
+    bus = MqttBus(
+        settings.mqtt_host,
+        settings.mqtt_port,
+        client_id=f"rpghome-engine-{os.getpid()}",
+        will=(topics.ONLINE, topics.ONLINE_OFF),
+        keepalive_s=KEEPALIVE_S,
+    )
+    link = EngineLink(engine, bus)
+    bus.add_connect_hook(link.announce)  # after a reconnect: online: true and the state now
+    link.start()
+    log.info(
+        "engine on the bus: %s:%d, commands on %s",
+        settings.mqtt_host,
+        settings.mqtt_port,
+        topics.CMD_FILTER,
+    )
+    return link
 
 
 def write_report(path: Path, report: dict) -> None:
@@ -261,6 +314,12 @@ def run(args: argparse.Namespace, settings: Settings, stop: _StopSignals) -> int
         dev.render_to_file(args.offline, frames, should_stop=stop.event.is_set)
         mode, playing, failure = "offline", None, None
     else:
+        link, lock = None, None
+        if scene is None and args.seconds is None:  # no arguments: the launchd mode, on the bus
+            lock = take_engine_lock(settings)
+            if lock is None:
+                return 0
+            link = start_link(engine, settings)
         deadline = started + args.seconds if args.seconds else None
         next_status = started + STATUS_LOG_EVERY_S
         playing, failure, output = None, None, None
@@ -303,6 +362,8 @@ def run(args: argparse.Namespace, settings: Settings, stop: _StopSignals) -> int
                         s["timings_ms"]["control"],
                     )
             playing = engine.status()
+            if link is not None:  # the closing fade is not a place to land a new command
+                link.begin_shutdown()
             engine.stop(STOP_FADE_S)
             time.sleep(STOP_FADE_S + 0.1)
         except AudioOutputError as exc:
@@ -312,6 +373,10 @@ def run(args: argparse.Namespace, settings: Settings, stop: _StopSignals) -> int
         finally:
             if output is not None:
                 output.close()
+            if link is not None:  # online: false and the state that ends the run, then goodbye
+                link.close()
+            if lock is not None:
+                lock.release()
         mode = "device"
     wall = time.monotonic() - started
     if args.report:

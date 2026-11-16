@@ -7,10 +7,10 @@ It is built from a native playback engine, an app server and an MQTT broker, all
 started and stopped with one script.
 
 This repo currently contains the layered `rpghome` package, the MQTT broker (mosquitto in
-docker compose), the start/stop scripts, and the audio engine run by launchd (the
-`rpghome_engine` package): its core, the audio path, the ambient bed, spot sounds with
-distance and the scene reverb (see
-[Engine](#engine)); it does not listen to the bus yet.
+docker compose), the start/stop scripts, the `rpghome` command, and the audio engine run by
+launchd (the `rpghome_engine` package): its core, the audio path, the ambient bed, spot
+sounds with distance and the scene reverb (see [Engine](#engine)) and its side on the bus
+(see [Bus](#bus)).
 
 ## Setup
 
@@ -73,11 +73,139 @@ launchd job (LaunchAgent in the `gui/<uid>` domain, label `local.rpghome.engine`
   `caffeinate -i -w`, and `exec`s `.venv/bin/python -m rpghome_engine` (same PID, so
   launchd's SIGTERM reaches the engine). Run `scripts/engine.sh` by hand to debug it.
 
+## Bus
+
+Services talk over the broker (`127.0.0.1:1883`, `RPGHOME_MQTT_HOST` / `RPGHOME_MQTT_PORT`).
+Browsers never talk to it: they go through the app server. Payloads are JSON objects, QoS 1.
+
+- `bus/base.py` - the `Bus` interface: `publish(topic, payload, retain=False)`,
+  `subscribe(topic_filter, handler, on_invalid=None)`, `close()`, and `connected` (whether a
+  publish now would reach the subscribers - a service should not queue state behind a broker
+  that is down). `on_invalid(topic, raw_bytes, why)` is what a bus calls instead of the handler
+  for a message that is not a JSON object; a subscriber that passes none gets it logged and
+  dropped. `topic_matches()` implements the MQTT wildcards (`+` one level, `#` this level and
+  everything below).
+- `bus/mqtt.py` - `MqttBus` over paho-mqtt 2: a background network loop, a last will set before
+  connecting, automatic reconnect (1..10 s backoff) with the subscriptions renewed and the
+  connect hooks re-run after every (re)connect, JSON encode/decode. A message that is not a JSON
+  object goes to `on_invalid` (or is logged and dropped), and a handler that raises is logged:
+  nothing a broker hands us can raise inside the network thread. QoS 1 promises "at least once",
+  and the bus hands over what the broker gives it: saying what a repeated `(topic, id)` means
+  needs the answer that was already given to it, which only the answerer has. While the broker
+  is down a publish is dropped rather than queued, and an outage costs one warning and its end
+  one line of info, however many attempts it took - while before the broker was ever reached a
+  dropped publish is the normal start-up state and only a debug line. `wait_connected()` is for
+  the callers that want to know.
+- `bus/memory.py` - `InMemoryBus` for tests: the same rules inside one process - retained
+  messages, wildcards, a last will that `kill()` publishes, a payload that is not an object
+  handed to `on_invalid` - and delivery in the publishing thread, so a test needs no waiting.
+- `bus/recent.py` - `RecentCommands`, the bookkeeping of the service that answers commands: the
+  payload and the event of each of the last 500 `(topic, id)` pairs, so it can tell a redelivery
+  from a reused id (see [Events](#events)).
+- `bus/topics.py` - the names below, in one place.
+
+| topic                     | retained | what it carries                                                    |
+|---------------------------|----------|--------------------------------------------------------------------|
+| `rpghome/cmd/<command>`   | no       | a command: `scene`, `overlay`, `fx`, `set`, `stop`                  |
+| `rpghome/state`           | yes      | the engine's state: what plays, the levels, the counters            |
+| `rpghome/events`          | no       | the answer to a command                                             |
+| `rpghome/engine/online`   | yes      | `{"online": true}`; the engine's last will is `{"online": false}`   |
+
+### Commands
+
+`models/commands.py` builds them from the message - pydantic models in the style of
+`models/scene.py` - and names the field it refuses, as in `transition_s: ...` or
+`scene.bed.hold_s: ...`. Every command may carry an optional `"id"` (a string), echoed back in
+the event so a sender recognises its own answer.
+
+| command   | payload                                                                                             | the engine |
+|-----------|-----------------------------------------------------------------------------------------------------|------------|
+| `scene`   | `{"scene": <scene data, as in models/scene.py>, "transition_s": 10}` (`transition_s` optional)      | `engine.scene(...)` |
+| `stop`    | `{"fade_s": 2}` (optional)                                                                           | `engine.stop(...)` |
+| `set`     | `{"name": "master_gain_db" \| "bed_gain_db" \| "density", "value": -6.0}` (`density`: 0.1..10)     | `engine.set(...)` |
+| `overlay` | `{"name": ..., "on": true, "fade_s": 20}`                                                            | not supported yet |
+| `fx`      | `{"name": ..., "distance_m": 2500}`                                                                   | not supported yet |
+
+`scene` carries the scene **data**: resolving a scene name to data is the app server's job, the
+engine never reads scene files. `overlay` and `fx` are in the schema already, and this engine
+answers them with an error. `bed_gain_db` is the bed of the scene that is playing and `density`
+scales that scene's spot rate: with nothing playing both are answered with an error, not
+silently ignored.
+
+### Events
+
+After every command, on `rpghome/events`: `{"type": "ok", "command": ..., "id": ...}` or
+`{"type": "error", "command": ..., "id": ..., "error": "<clear message>"}`. `ok` means the engine
+**applied** the command: it waits for the control cycle that applies it and publishes the state
+before answering, so a client that reads the retained state after its own command already sees
+what plays. When that cycle never comes - a control thread that is stuck, or one that never
+started because the audio output failed - the answer is the error `the engine did not apply the
+command within 1 s`, never an `ok` for something that did not happen.
+
+**The same `(topic, id)` twice.** The engine remembers the payload and the event of every recent
+command. The same message again - a QoS 1 redelivery - is applied **once** and answered again
+with the earlier event, so a sender is never left waiting for an answer that already went out.
+The same id carrying another payload is the sender's mistake: it is refused, `id '1' was already
+used for another set command; ids must be unique`, and the engine keeps playing what it played.
+A command without an `id` cannot be recognised this way and is applied as it comes, as before.
+
+**A bad command never stops the engine.** An unknown command, a missing or misspelled field, a
+scene whose clip file is missing, `overlay` / `fx`, an exception inside the engine call - each is
+one error event, the engine keeps playing what it played and takes the next command. A message
+that is not a JSON object gets the same treatment: the bus hands it to the engine's `on_invalid`
+and the engine answers `{"type": "error", "command": <from the topic>, "error": "invalid JSON:
+..."}`. Commands are handed to a worker thread, so a slow one (loading clips) never blocks the
+network loop. Once the engine's own shutdown fade has started it takes no more commands - each
+one is answered `engine is stopping`, including the ones still queued when it closes, and
+including a `scene` whose clips finish loading after the signal arrived: `engine.scene(...,
+should_stop=...)` is asked again once they are read and before they are handed to the control
+thread, so such a scene never starts playing during the fade-out.
+Engine-side events (a bed clip change) are not published yet: they show up in the state.
+
+### State and the online flag
+
+`rpghome/state`, retained: `engine.status()` as a client sees it - `scene`, `clip`, `hold_s`,
+`hold_elapsed_s`, `levels`, `fading_out`, `seconds_rendered`, the output peak and limiter
+readings, `underruns`, `late_callbacks`, `gaps`, `nonfinite_blocks` (what a listener would have
+heard as crackles), `starved_blocks`, `late_events`, `bad_messages`, `planning_cycles`, plus
+`boot` and `version` - without the timings and the gap details, which stay in the reports.
+`version` rises with every publish **of one engine process**, so it starts at 1 again after a
+restart; `boot` is when that process started (an integer, ns since the epoch, the same in every
+state it publishes). A client orders the states it is given by `(boot, version)` - `version`
+alone cannot tell two engine runs apart. Published after each command (after the engine applied
+it) and every 2 s, but only when what plays changed or when the last publish is 10 s old, so the
+counters still move. Retained: a subscriber that starts later gets the last state at once. The
+command thread and the state thread both publish it, so it is serialised and a client never sees
+an older state of the same run arrive after a newer one. While the broker is down nothing is
+queued: the engine publishes the state as it is now when the connection is back.
+
+The engine publishes `{"online": true}` (retained) when it connects and again after every
+reconnect - together with the state, which is what publishes it once more after an outage. Its
+last will is `{"online": false}`, so a killed or crashed engine reads as offline within seconds
+(keepalive 5 s). On SIGTERM it stops taking commands, publishes `online: false` and the state
+that ends the run, closes the bus and exits 0.
+
 ## The `rpghome` command
 
-`uv run rpghome config` prints the resolved settings (data, state and log folders,
-MQTT host and port) and exits 1 if they are invalid. `uv run rpghome library ...` manages
-the clip catalog (see [Library](#library)).
+```sh
+uv run rpghome config                       # the resolved settings; exit 1 if invalid
+uv run rpghome scene FILE.json [--transition S] [--timeout S]   # FILE.json holds the scene data
+uv run rpghome stop [--fade S] [--timeout S]                    # fade out, then silence
+uv run rpghome set NAME VALUE [--timeout S] # master_gain_db, bed_gain_db or density, e.g. -6
+uv run rpghome status                       # the retained state and the online flag
+uv run rpghome library ...                  # the clip catalog (see "Library")
+```
+
+`scene`, `stop` and `set` read the retained `rpghome/engine/online` first (up to 1 s): an engine
+that is not there gets `engine is offline` and exit 1, **with nothing sent to the broker** - a
+command no one took would only end as our own timeout. Then they publish and wait for the event
+carrying their `id`: 15 s for `scene` (the engine reads the scene's clips before it answers),
+5 s for `stop` and `set`, and `--timeout S` for any of them. Exit 0 on `ok`, exit 1 on an error
+event, on an unreadable or invalid scene file, or when the broker is not there. `rpghome status`
+reads the retained `rpghome/state` and `rpghome/engine/online` and exits 1 when the engine is
+offline or no state arrives within ~3 s. Starting and stopping is still done by the scripts, not
+by the command. `uv run rpghome library ...` manages the clip catalog (see
+[Library](#library)).
 
 ## Library
 
@@ -343,7 +471,7 @@ the device's maximum role raises `PermissionDenied`.
 | variable            | default                  | meaning |
 |---------------------|--------------------------|---------|
 | `RPGHOME_ARTIFACTS` | `~/rpg_home_artifacts`   | data folder (scenes, tiles, clips, catalog); a leading `~` is expanded |
-| `RPGHOME_STATE`     | `~/.local/state/rpghome` | runtime state: `logs/engine.log`, `launchd/<label>.plist`. Must not be inside the data folder. |
+| `RPGHOME_STATE`     | `~/.local/state/rpghome` | runtime state: `logs/engine.log`, `launchd/<label>.plist`, `engine.lock`, `engine-audio-failure.json`. Must not be inside the data folder. |
 | `RPGHOME_MQTT_HOST` | `127.0.0.1`              | broker host for the engine (and later the app) |
 | `RPGHOME_MQTT_PORT` | `1883`                   | broker port, also checked by `start.sh` / `status.sh` |
 | `RPGHOME_ENGINE_LABEL` | `local.rpghome.engine` | launchd label of the engine job (use another one for tests and checks) |
@@ -352,6 +480,7 @@ the device's maximum role raises `PermissionDenied`.
 | `RPGHOME_AUDIO_DEVICE` | unset                | engine output: unset = the default device, a device name or index, `null` (a real-time fake device with no sound, for tests), or `null-stalled` (one that never pulls a block, to test the watchdog) |
 | `RPGHOME_AUDIO_LATENCY` | `0.05`             | engine output latency asked of the stream: seconds (0 < s <= 2), or PortAudio's `low` / `high`. 50 ms leaves room for effects (target: under 100 ms from click to sound); ambience alone tolerates more. The latency the stream got is logged. |
 | `RPGHOME_SKIP_PULL` | unset                    | `scripts/setup.sh docker` skips `docker compose pull` when set to `1` |
+| `RPGHOME_REQUIRE_BROKER` | unset               | tests only: `1` makes a missing broker a **failure** instead of a skip, so a run meant to use one cannot pass without it |
 
 ## Layout
 
@@ -370,8 +499,10 @@ migrations/, alembic.ini    Alembic migrations of the clip catalog, see "Library
 src/rpghome/                the app package, in layers (below)
 src/rpghome_engine/         the engine package: the native audio process (see "Engine")
 tests/                      pytest, mirrors the packages (core/, models/, repositories/, infra/,
-                            managers/, engine/, cli/); audio.py: synthetic WAVs, mini sound-gen;
-                            test_setup_sh.py, test_scripts.py (fake docker/launchctl/nc)
+                            managers/, bus/, engine/, cli/); audio.py: synthetic WAVs, mini
+                            sound-gen; test_setup_sh.py, test_scripts.py (fake
+                            docker/launchctl/nc); bus/test_mqtt_broker.py needs a real broker
+                            (see "Development")
 ```
 
 Package layers (`src/rpghome/`):
@@ -386,7 +517,7 @@ repositories/  persistence: catalog (SQLAlchemy async on SQLite, ORM tables, cat
                scene files, git of the data folder
 managers/      application logic: scene loading and checks, catalog import, permissions
                (roles.toml: the default roles config shipped with the package)
-bus/           MQTT: Bus interface, MqttBus, InMemoryBus, topics
+bus/           MQTT: Bus interface, MqttBus, InMemoryBus, topics, RecentCommands
 infra/         wrappers around external tools and services (Epidemic API client, MOSS generation, ffmpeg)
 api/           FastAPI: app.py, routers/, ws.py, deps.py, schemas.py (REST DTOs)
 runner/        scene scripts
@@ -398,12 +529,13 @@ scripts above, not by Python code.
 ```
 
 Engine package (`src/rpghome_engine/`): core.py (commands, control cycle, status), mixer.py
-(audio thread), bed.py, clips.py, limiter.py, devices.py, memory.py, stats.py, __main__.py.
+(audio thread), bed.py, clips.py, limiter.py, devices.py, memory.py, spots.py, stats.py,
+link.py (the bus side), instance_lock.py (one engine at a time), __main__.py.
 
 The engine is its own top-level package, not a layer of `rpghome`, because it is a separate
 native process that never runs inside the app server. Both are in the same project (one
 `pyproject.toml`, one `.venv`, one wheel). The contract between them is the scene data
-(`rpghome.models.scene`) and, later, the MQTT topics, so the engine could one day be
+(`rpghome.models.scene`) and the MQTT topics, so the engine could one day be
 replaced by another implementation without touching the app.
 
 Imports between subpackages go only downwards (checked by `tests/test_layers.py`):
@@ -581,11 +713,11 @@ already resolved; it never reads scene files or the catalog.
 
 ### Command API
 
-Thread-safe methods of `rpghome_engine.core.Engine` (the bus calls them in a later task):
+Thread-safe methods of `rpghome_engine.core.Engine` (the bus side calls them, see [Bus](#bus)):
 
 | method | what it does |
 |--------|--------------|
-| `scene(scene, transition_s=10)` | loads the clips (a missing or unreadable file raises `EngineError`, and the engine keeps playing), then switches with an equal-power crossfade. The old scene stops planning at once: no new clip starts, material it had planned past the switch is dropped, and what plays fades out. |
+| `scene(scene, transition_s=10, *, should_stop=None)` | loads the clips (a missing or unreadable file raises `EngineError`, and the engine keeps playing), then switches with an equal-power crossfade. `should_stop()` is asked again once the clips are read and before they are handed to the control thread: a caller that is already fading out gets `EngineError` (`engine is stopping`) and nothing changes. The old scene stops planning at once: no new clip starts, material it had planned past the switch is dropped, and what plays fades out. |
 | `stop(fade_s=2)` | fades everything out; then silence |
 | `set(name, value)` | `master_gain_db`, or `bed_gain_db` (the bed of the current scene; the next scene starts at its own bed `gain_db`), or `density` (0.1-10, the current scene's spot rate; the next scene starts at 1). With no scene, or a scene without a bed, `bed_gain_db` is ignored with a warning in the log, not kept for later; so is `density` with no scene. |
 | `status()` | scene, current clip, `hold_s` (`None` for a one-clip pool) and `hold_elapsed_s`, levels (with `density`), `spot_layers`, `spot_events` (started so far), `seconds_rendered`, `late_callbacks`, `gaps`, `max_gap_ms`, `min_headroom_ms`, `slow_callbacks`, `nonfinite_blocks`, output peak and lowest limiter gain over the last ~2 s and since the start, underruns, starved blocks, late buffers, bad messages, planning cycles, control-cycle and callback times (p50, p95 of the whole run from a fixed log-scale histogram, to about 6 %; exact max; in ms). Reading changes nothing and costs the same (about 20 µs) however long the run: any number of readers can poll. |
@@ -608,8 +740,18 @@ so a render depends only on the seed and the commands. The tests use only this.
     [--offline out.wav] [--seed S] [--transition S]
 ```
 
-- No arguments: opens the output stream, plays silence, waits for commands (none arrive
-  until the bus exists) and for SIGTERM / SIGINT, then fades out and exits.
+- No arguments (how launchd runs it): takes `<state>/engine.lock`, opens the output stream, plays
+  silence and takes its commands over the bus (see [Bus](#bus)). On SIGTERM / SIGINT it stops
+  taking commands, fades out, publishes `online: false` and the state that ends the run, closes
+  the bus and exits; a command that arrives during the fade is answered `engine is stopping`.
+  - The broker may be down at start, and may go down while it runs: the engine plays silence and
+    keeps retrying the connection in the background (one warning for the outage, one line when it
+    is back), publishes no state behind the outage, and publishes `online: true` and the state as
+    it is now when the broker is back. It does not exit, or launchd would loop on it.
+  - One engine at a time: `scripts/engine.sh` run by hand next to the launchd job logs "another
+    engine is running" and exits 0. The lock is an exclusive `fcntl.flock` on
+    `<state>/engine.lock`; the file stays in place (deleting it would race with the next starter).
+  - `--scene`, `--seconds` and `--offline` are the manual modes: no bus, no lock.
 - `--scene`: plays the scene (fading in over `--transition`, default 2 s) until a signal,
   or for `--seconds`. `--offline out.wav` renders `--seconds` into a 24-bit WAV with no
   device. `--report` writes the last `status()` while playing, the measurements
@@ -701,8 +843,23 @@ uv run ruff format --check
 for f in scripts/*.sh; do bash -n "$f"; done
 ```
 
-Tests never touch the real data or state folders, Docker, launchd or the sound card: they set
+Tests never touch the real data or state folders, launchd or the sound card: they set
 `RPGHOME_ARTIFACTS` / `RPGHOME_STATE` to temporary directories, put fake `docker`,
 `launchctl`, `nc` and `caffeinate` executables first on `PATH`, render the engine offline
-from synthetic clips (tones and noise with known levels), and run the engine process with
-`RPGHOME_AUDIO_DEVICE=null`.
+from synthetic clips (tones and noise with known levels), drive it over an `InMemoryBus`, and run
+the engine process with `RPGHOME_AUDIO_DEVICE=null`.
+
+The exception is the tests marked `broker`, which talk to a real mosquitto on `127.0.0.1:1883`
+and skip when that port is closed:
+
+```sh
+docker compose up -d mosquitto && uv run pytest -m broker
+docker compose down
+```
+
+`RPGHOME_REQUIRE_BROKER=1` makes a missing broker fail those tests instead of skipping them -
+use it when a run is meant to prove the broker path:
+
+```sh
+docker compose up -d mosquitto && RPGHOME_REQUIRE_BROKER=1 uv run pytest -m broker
+```
